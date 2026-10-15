@@ -34,6 +34,12 @@ type ProjectionValue = any;
 interface DshClientContext {
   get(name: string): any;
   slots: { register(options: any, component: any): void; inject(name: string, run: () => void): void };
+  /**
+   * Optional-service injection: the callback runs only while every named service is
+   * provided, and inside it the service is a legal property read. Absent entirely on a
+   * context that does not offer it — the badge then falls back to `ctx.get`.
+   */
+  inject?(dependencies: string[], run: (child: any) => void): void;
   effect(run: () => void): void;
   [key: string]: any;
 }

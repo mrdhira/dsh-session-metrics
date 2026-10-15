@@ -201,13 +201,13 @@ Two consequences worth remembering:
 ## What the suite does and does not cover
 
 - `test/build.test.ts` — artifacts mirror sources, are fresh, and resolve inside the package.
-- `test/parity.test.js` — the browser half's embedded cost arithmetic against the host's,
+- `test/parity.test.ts` — the browser half's embedded cost arithmetic against the host's,
   across a matrix of cards, tiers and token mixes, driven through the shipped bundle.
-- `test/pricing.test.js`, `settings.test.js`, `ledger.test.js` — the pure host logic.
-- `test/replay.test.js` — a real session log, comparing the ledger against the official
+- `test/pricing.test.ts`, `settings.test.ts`, `ledger.test.ts` — the pure host logic.
+- `test/replay.test.ts` — a real session log, comparing the ledger against the official
   `tokenUsage` fold. It uses a `maybe(...)` wrapper and **skips when `DSH_SESSION_LOG` is
   unset**; the runner reports those skips rather than passing them silently.
-- `test/client.dom.test.ts`, `test/pricing-page.dom.test.js` — the two client surfaces under
+- `test/client.dom.test.ts`, `test/pricing-page.dom.test.ts` — the two client surfaces under
   jsdom through a stub loader that mirrors the restricted context.
 
 Typing is deliberate and uneven: the host domain modules are `strict`, while the dynamic

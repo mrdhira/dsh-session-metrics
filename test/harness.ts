@@ -38,8 +38,189 @@ export interface LoadedBundle {
   dom: JSDOM;
   inject: unknown;
   registrations: Registration[];
+  /** The plugin the bundle's factory returned, so a test can re-apply it to another context. */
+  plugin: any;
   /** The registration for one slot name. */
   slot(name: string): Registration;
+}
+
+/**
+ * How a context offers the optional `configForms` service (T-001).
+ *
+ * - `none`: no `ctx.inject` at all — the fallback path through `ctx.get`.
+ * - `present`: `ctx.inject(['configForms'], cb)` runs the callback, and inside it the
+ *   service is a readable property, exactly as the real optional injection behaves.
+ * - `absent`: the injection exists but the service never arrives, so the callback never
+ *   runs — a deployment without the settings UI, where this plugin contributes nothing.
+ */
+export type ConfigFormsAttachment = 'none' | 'present' | 'absent';
+
+/** Options for `clientContext`. */
+export interface ClientContextOptions {
+  /** Where the context records what the plugin registers. */
+  registrations: Registration[];
+  /** Where the optional `configForms` service is offered. Defaults to `none`. */
+  attachment?: ConfigFormsAttachment;
+  /** Read the `configForms` service at call time; the default serves nothing. */
+  configForms?: () => unknown;
+}
+
+/**
+ * Build the restricted client context the bundle's `apply` runs against.
+ *
+ * Exported so a test can re-apply the plugin to a context with a different
+ * `configForms` attachment without paying for a second jsdom realm. The proxy mirrors
+ * the real restricted client context exactly:
+ *   - a service named in the plugin's `inject` may be read as a property;
+ *   - any other service read as a property THROWS (this is what crashed the live
+ *     strip), while `ctx.get(name)` stays safe and may return undefined.
+ * @param options - the registrations sink, the attachment mode and the service reader.
+ * @returns the context to hand to `plugin.apply`.
+ */
+export function clientContext(options: ClientContextOptions): unknown {
+  const { registrations, attachment = 'none' } = options;
+  const readConfigForms = options.configForms ?? (() => null);
+
+  const slotsService = {
+    inject(dependency: string, callback: () => void) {
+      callback();
+      return () => {};
+    },
+    register(spec: Registration['spec'], component: Registration['component']) {
+      registrations.push({ spec, component });
+      return () => {};
+    },
+  };
+  const sessionsService = { refreshProjections: () => Promise.resolve() };
+  const get = (name: string): unknown => {
+    if (name === 'configForms') return readConfigForms();
+    if (name === 'sessions') return sessionsService;
+    return undefined;
+  };
+  const target: Record<string, unknown> = { get, slots: slotsService };
+  if (attachment !== 'none') {
+    target.inject = (dependencies: unknown, callback: (child: unknown) => void) => {
+      if (attachment === 'absent') return () => {};
+      // Mirrors Cordis's optional injection: the callback receives a child context on
+      // which the declared service is a legal property read.
+      callback({
+        slots: slotsService,
+        get,
+        get configForms() { return readConfigForms(); },
+      });
+      return () => {};
+    };
+  }
+  return new Proxy(target, {
+    get(object, property) {
+      if (property in object || typeof property === 'symbol') return Reflect.get(object, property);
+      throw new Error(`cannot get property "${String(property)}" without declaring it (use ctx.get)`);
+    },
+  });
+}
+
+/**
+ * The `configForms` stub the shared context serves, set per test.
+ *
+ * Kept dynamic on purpose: several tests load the bundle once and change which form
+ * the service serves between mounts, so the read has to happen at render time.
+ */
+let currentConfigForms: unknown = null;
+
+/**
+ * Serve one `configForms` stub to the shared client context.
+ * @param stub - the stub, or null to clear it.
+ */
+export function useConfigForms(stub: unknown): void {
+  currentConfigForms = stub === undefined ? null : stub;
+}
+
+/**
+ * The one evaluated bundle, in the `none` attachment mode.
+ *
+ * A realm per test was the harness's real cost: each JSDOM document and VM context is
+ * megabytes of native state, and building ~20 of them left V8 with gigabytes of off-heap
+ * garbage to collect after the tests had already finished. The bundle is realm-scoped
+ * anyway, so one realm plus a fresh container per mount is both faster and closer to the
+ * browser, where the module is evaluated once. A test that needs the other attachment
+ * doors re-applies the returned `plugin` to a `clientContext` instead of loading again.
+ */
+let shared: LoadedBundle | null = null;
+
+/**
+ * Evaluate the bundle against a shared DOM.
+ * @returns the DOM, what the bundle registered, the plugin, and the plugin's inject list.
+ */
+export function loadBundle(): LoadedBundle {
+  if (shared !== null) return shared;
+  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+    url: 'http://localhost/',
+  });
+  // React renders in this realm while the component is defined in the VM realm,
+  // so the DOM globals must exist on both sides.
+  const realm = dom.window as unknown as Window & typeof globalThis;
+  globalThis.window = realm;
+  globalThis.document = realm.document;
+
+  const registrations: Registration[] = [];
+  const SENTINEL = Symbol('not-applied');
+  let applied: unknown = SENTINEL;
+  let inject: unknown = null;
+  let plugin: any = null;
+
+  const sandbox: Record<string, unknown> = {
+    window: dom.window,
+    document: dom.window.document,
+    Intl,
+    Date,
+    Math,
+    JSON,
+    Promise,
+    console,
+    setTimeout: dom.window.setTimeout.bind(dom.window),
+    clearTimeout: dom.window.clearTimeout.bind(dom.window),
+  };
+  sandbox.globalThis = sandbox;
+
+  dom.window.__ModuleLoader__ = {
+    load({ id, factory }: { id: string; factory: (require: (specifier: string) => unknown) => any }) {
+      assert.equal(id, 'dsh-session-metrics', 'the bundle id must equal the package name');
+      plugin = factory((specifier) => {
+        if (specifier === 'react') return React;
+        if (specifier === 'react-dom') return ReactDOM;
+        throw new Error(`unexpected require("${specifier}")`);
+      });
+      // Compared as a string: the bundle runs in a VM realm, so its Array has a
+      // different prototype and a strict deep-equality check would fail on that alone.
+      assert.equal(String(plugin.inject), 'slots');
+      inject = plugin.inject;
+      // The shared context offers no `ctx.inject`: the badge and the page take the
+      // fallback path through `ctx.get`, which is what the harness has always modelled.
+      // `clientContext` builds the other attachment doors for the tests that need them.
+      const ctx = clientContext({ registrations, configForms: () => currentConfigForms });
+      applied = plugin.apply(ctx);
+    },
+  };
+
+  runInContext(SOURCE, createContext(sandbox));
+  // Strict: `assert.notEqual` is loose, and `null == undefined` would fail here
+  // even when the bundle loaded perfectly.
+  assert.notStrictEqual(applied, SENTINEL, 'the bundle should have loaded');
+
+  const loaded: LoadedBundle = {
+    dom,
+    inject,
+    registrations,
+    plugin,
+    /** The registration for one slot name. */
+    slot(name: string): Registration {
+      const found = registrations.filter((entry) => entry.spec.name === name);
+      assert.equal(found.length, 1, `expected exactly one ${name} registration, got ${found.length}`);
+      return found[0];
+    },
+  };
+  shared = loaded;
+  return loaded;
 }
 
 /** Handles for interacting with one mounted tree. */
@@ -75,126 +256,6 @@ declare global {
 }
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-
-/**
- * The one evaluated bundle for this file.
- *
- * A realm per test was the harness's real cost: each JSDOM document and VM
- * context is megabytes of native state, and building ~20 of them left V8 with
- * gigabytes of off-heap garbage to collect after the tests had already finished.
- * The bundle is realm-scoped anyway, so one realm plus a fresh container per mount
- * is both faster and closer to the browser, where the module is evaluated once.
- */
-let shared: LoadedBundle | null = null;
-
-/** The `configForms` stub the shared context serves, set per test. */
-let currentConfigForms: unknown = null;
-
-/**
- * Serve one `configForms` stub to the shared client context.
- * @param stub - the stub, or null to clear it.
- */
-export function useConfigForms(stub: unknown): void {
-  currentConfigForms = stub === undefined ? null : stub;
-}
-
-/**
- * Evaluate the bundle once against a shared DOM.
- * @returns the DOM, what the bundle registered, and the plugin's inject list.
- */
-export function loadBundle(): LoadedBundle {
-  if (shared !== null) return shared;
-  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
-    url: 'http://localhost/',
-  });
-  // React renders in this realm while the component is defined in the VM realm,
-  // so the DOM globals must exist on both sides.
-  const realm = dom.window as unknown as Window & typeof globalThis;
-  globalThis.window = realm;
-  globalThis.document = realm.document;
-
-  const registrations: Registration[] = [];
-  const SENTINEL = Symbol('not-applied');
-  let applied: unknown = SENTINEL;
-  let inject: unknown = null;
-
-  const sandbox: Record<string, unknown> = {
-    window: dom.window,
-    document: dom.window.document,
-    Intl,
-    Date,
-    Math,
-    JSON,
-    Promise,
-    console,
-    setTimeout: dom.window.setTimeout.bind(dom.window),
-    clearTimeout: dom.window.clearTimeout.bind(dom.window),
-  };
-  sandbox.globalThis = sandbox;
-
-  dom.window.__ModuleLoader__ = {
-    load({ id, factory }: { id: string; factory: (require: (specifier: string) => unknown) => any }) {
-      assert.equal(id, 'dsh-session-metrics', 'the bundle id must equal the package name');
-      const plugin = factory((specifier) => {
-        if (specifier === 'react') return React;
-        if (specifier === 'react-dom') return ReactDOM;
-        throw new Error(`unexpected require("${specifier}")`);
-      });
-      // Compared as a string: the bundle runs in a VM realm, so its Array has a
-      // different prototype and a strict deep-equality check would fail on that alone.
-      assert.equal(String(plugin.inject), 'slots');
-      inject = plugin.inject;
-      // Mirrors the real restricted client context exactly:
-      //   - a service named in the plugin's `inject` may be read as a property;
-      //   - any other service read as a property THROWS (this is what crashed the
-      //     live strip), while `ctx.get(name)` stays safe and may return undefined.
-      const slotsService = {
-        inject(dependency: string, callback: () => void) {
-          callback();
-          return () => {};
-        },
-        register(spec: Registration['spec'], component: Registration['component']) {
-          registrations.push({ spec, component });
-          return () => {};
-        },
-      };
-      const sessionsService = { refreshProjections: () => Promise.resolve() };
-      const target = {
-        get(name: string) {
-          if (name === 'configForms') return currentConfigForms;
-          if (name === 'sessions') return sessionsService;
-          return undefined;
-        },
-        slots: slotsService,
-      };
-      const ctx = new Proxy(target, {
-        get(object, property) {
-          if (property in object || typeof property === 'symbol') return Reflect.get(object, property);
-          throw new Error(`cannot get property "${String(property)}" without declaring it (use ctx.get)`);
-        },
-      });
-      applied = plugin.apply(ctx);
-    },
-  };
-
-  runInContext(SOURCE, createContext(sandbox));
-  // Strict: `assert.notEqual` is loose, and `null == undefined` would fail here
-  // even when the bundle loaded perfectly.
-  assert.notStrictEqual(applied, SENTINEL, 'the bundle should have loaded');
-
-  shared = {
-    dom,
-    inject,
-    registrations,
-    /** The registration for one slot name. */
-    slot(name: string): Registration {
-      const found = registrations.filter((entry) => entry.spec.name === name);
-      assert.equal(found.length, 1, `expected exactly one ${name} registration, got ${found.length}`);
-      return found[0];
-    },
-  };
-  return shared;
-}
 
 /**
  * Mount one registered component.

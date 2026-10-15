@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 
 import { Config, resolveSettings } from '../lib/v1/settings.js';
 import { loadBundle, mount, useConfigForms, type MountedView } from './harness.ts';
+import { ROW_ID } from './namespace.ts';
 
 const resolved = resolveSettings({});
 const shippedProviders = resolved.providers;
@@ -25,7 +26,7 @@ interface FormCall {
   refused?: boolean;
 }
 
-/** A stub Host config form, shaped like the one `ctx.configForms.get(entryId)` returns. */
+/** A stub Host config form, shaped like the one `ctx.configForms.get(namespace)` returns. */
 interface FormStub {
   calls: FormCall[];
   getSnapshot(): Record<string, any>;
@@ -43,7 +44,7 @@ interface FormOptions {
   writability?: string;
 }
 
-/** A stub Host config form, shaped like `ctx.configForms.get(entryId)`. */
+/** A stub Host config form, shaped like `ctx.configForms.get(namespace)`. */
 function makeForm({ value = { display: resolved.display, budget: resolved.budget, providers: shippedProviders }, base = { providers: shippedProviders }, revision = 7, writability = 'writable' }: FormOptions = {}): FormStub {
   const calls: FormCall[] = [];
   const listeners = new Set<() => void>();
@@ -74,15 +75,21 @@ function renderPage(configForms: unknown): MountedView {
   useConfigForms(configForms);
   const loaded = loadBundle();
   const registration = loaded.slot('plugins.row.config');
-  assert.equal(registration.spec.key, 'dsh-session-metrics#session-metrics', 'the ledger reads entry.options.key');
+  assert.equal(registration.spec.key, 'dsh-session-metrics#' + ROW_ID, 'the ledger reads entry.options.key');
   const view = mount(loaded, registration, {});
   return view;
 }
 
-const entryIdSeen: string[] = [];
+/**
+ * The namespaces the page asked `configForms` for.
+ *
+ * Reset per test rather than read as `[0]`: module-global history only means
+ * "this render" by accident of test order.
+ */
+const namespacesSeen: string[] = [];
 const configFormsFor = (form: unknown) => ({
-  get(entryId: string) {
-    entryIdSeen.push(entryId);
+  get(namespace: string) {
+    namespacesSeen.push(namespace);
     return form;
   },
 });
@@ -91,11 +98,12 @@ test('registration: the editor is offered both inline on the bundle page and on 
   const loaded = loadBundle();
   const specs = loaded.registrations.map((entry) => `${entry.spec.name}:${entry.spec.key ?? entry.spec.id}`);
   assert.ok(specs.includes('plugins.bundle.config:dsh-session-metrics'), 'inline on the plugin page, keyed by package name');
-  assert.ok(specs.includes('plugins.row.config:dsh-session-metrics#session-metrics'), 'and on the row page');
+  assert.ok(specs.includes('plugins.row.config:dsh-session-metrics#' + ROW_ID), 'and on the row page');
 });
 
 test('page: lists every integrated provider with its models', () => {
   const form = makeForm();
+  namespacesSeen.length = 0;
   const view = renderPage(configFormsFor(form));
   try {
     const text = view.text();
@@ -108,9 +116,11 @@ test('page: lists every integrated provider with its models', () => {
     // The id `configForms` is keyed by is the settings NAMESPACE (the id the bundle's patch
     // declares), not the Loader's entry id. Asserting the wrong one is the bug this pins: the
     // entry id returns a controller whose value layer is unavailable, so the page would look
-    // read-only or empty with no error anywhere.
-    assert.equal(entryIdSeen[0], 'session-metrics', 'the page reads the settings namespace');
-    assert.notEqual(entryIdSeen[0], 'include:session-metrics', 'never the Loader entry id');
+    // read-only or empty with no error anywhere. The expected value is read from the patch
+    // file, so a namespace rename fails here instead of passing silently.
+    assert.equal(namespacesSeen.length > 0, true, 'the page asked the service for a namespace');
+    assert.deepEqual([...new Set(namespacesSeen)], [ROW_ID], 'the page asks only for the settings namespace');
+    assert.equal(namespacesSeen.includes('include:' + ROW_ID), false, 'never the Loader entry id');
   } finally {
     view.unmount();
   }

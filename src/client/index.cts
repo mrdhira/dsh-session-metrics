@@ -269,7 +269,13 @@ function tierAt(ms, billing) {
   const zone = billing.timezone || 'UTC';
   const at = zoned(new Date(ms), zone);
   if (((billing.weekdays) || []).indexOf(at.weekday) < 0) return 'off-peak';
-  if (((billing.holidays) || []).indexOf(at.date) >= 0) return 'off-peak';
+  // Holiday dates are written in `holidayZone`, which is not necessarily the
+  // billing zone. The Host's own `tierAt` resolves them there, so a chip that
+  // read them in the provider zone could show peak on a day the Host charged
+  // off-peak.
+  const holidays = (billing && billing.holidays) || [];
+  if (holidays.length > 0
+    && holidays.indexOf(zoned(new Date(ms), (billing && billing.holidayZone) || zone).date) >= 0) return 'off-peak';
   const inside = windows.some(function (w) {
     return w[0] <= w[1] ? at.hour >= w[0] && at.hour < w[1] : at.hour >= w[0] || at.hour < w[1];
   });
@@ -303,13 +309,17 @@ function nextBoundary(ms, billing) {
  * `tier` is null when no configured provider has a peak window: a flat provider
  * has no off-peak rate, and naming "flat" beside a peak/off-peak chip would
  * claim a state that provider never enters. `zone` names the calendar the tier
- * was read in.
+ * was read in, `tierProvider` names whose calendar it is, and `boundary` is the
+ * instant that tier next changes (null when it never does), so a mounted chip can
+ * re-read it instead of going stale.
  */
 interface BadgePayload {
   providers: number;
   models: number;
   tier: string | null;
   zone: string | null;
+  tierProvider: string | null;
+  boundary: number | null;
   title: string;
 }
 
@@ -319,35 +329,17 @@ interface BadgePayload {
  * `readSnapshot` accepts either the owner's `{ state, mutate }` form or a settings
  * controller. Only the `value` layer counts: `base` is what an override would inherit,
  * and a badge built from shipped defaults would claim configuration that is not there.
+ * The accepted layer is an **own** property of the snapshot — a prototype answer is not
+ * the layer the form accepted.
+ * @param form - the form or controller the badge read.
+ * @returns the accepted value layer, or null when there is none.
  */
 function badgeValue(form: any) {
   const snap = readSnapshot(form);
   if (snap === null || snap === undefined) return null;
-  // Read the own property only: the prototype must not answer for the accepted layer.
-  return snap.value === undefined ? null : snap.value;
-}
-
-/**
- * One provider's billing calendar, with every field `tierAt` reads.
- *
- * `weekdays` and `holidays` are guards inside `tierAt`, so a calendar copied
- * without them reports off-peak for every instant of a peak window — which is
- * what a half-copied calendar did before this carried them.
- * @param provider - a provider from the resolved configuration.
- * @returns the calendar, or null when the provider carries none.
- */
-function billingOf(provider: any) {
-  const billing = provider && typeof provider === 'object' ? provider.billing : null;
-  if (billing === null || typeof billing !== 'object') return null;
-  return {
-    windows: Array.isArray(billing.windows) ? billing.windows : [],
-    // The schema lists the weekdays CHARGED AT PEAK, and `tierAt` reads an instant
-    // outside that list as off-peak — so an empty list is "no peak day", not "every
-    // day". Carried through exactly as it arrives.
-    weekdays: Array.isArray(billing.weekdays) ? billing.weekdays : [],
-    holidays: Array.isArray(billing.holidays) ? billing.holidays : [],
-    timezone: typeof billing.timezone === 'string' && billing.timezone !== '' ? billing.timezone : 'UTC',
-  };
+  if (!Object.prototype.hasOwnProperty.call(snap, 'value')) return null;
+  const value = snap.value;
+  return value === undefined || value === null ? null : value;
 }
 
 /**
@@ -357,6 +349,11 @@ function billingOf(provider: any) {
  * something true: an empty chip is the failure mode T-001 exists to avoid, so
  * every branch that lacks a real provider list, or a real price state, returns
  * null and the slot renders nothing at all.
+ *
+ * The calendar comes from `normalizeProviders` — the same normalizer the editor
+ * uses — so a partial layer takes exactly the defaults the Host schema declares
+ * (weekdays Mon–Fri, `holidayZone` Asia/Shanghai) and the badge can never
+ * disagree with the strip about the tier.
  * @param value - the accepted configuration layer.
  * @param nowMs - the instant to read the calendar at.
  * @returns the payload, or null when the badge must stay away.
@@ -367,56 +364,77 @@ function badgePayload(value: any, nowMs: number): BadgePayload | null {
   let models = 0;
   let calendar = null;
   let zone = 'UTC';
-  let windowed = false;
+  let tierProvider = null;
   providers.forEach(function (provider) {
     if (Array.isArray(provider && provider.models)) models += provider.models.length;
-    const billing = billingOf(provider);
-    if (billing === null || billing.windows.length === 0) return;
-    windowed = true;
+    const billing = normalizeProviders([provider])[0].billing;
+    if (billing.windows.length === 0) return;
     // The first provider with a peak window supplies the calendar: that is the state
-    // the chip names, and the title says which zone it was read in.
+    // the chip names, and the title names that provider rather than attributing its
+    // calendar to all of them.
     if (calendar === null) {
       calendar = billing;
       zone = billing.timezone;
+      tierProvider = provider && typeof provider.id === 'string' && provider.id !== ''
+        ? provider.id
+        : 'the first provider with peak windows';
     }
   });
   const tier = calendar === null ? null : tierAt(nowMs, calendar);
-  const title = (windowed
-    ? 'The peak/off-peak state right now, in ' + zone + ', for ' + providers.length +
-      ' configured provider(s) with ' + models + ' model(s). Read from this plugin\u2019s own configuration.'
-    : 'No configured provider has peak windows, so every hour is charged at one rate. ' +
-      providers.length + ' provider(s) and ' + models + ' model(s) are configured.')
-    + ' Set rates on the component row under dsh-session-metrics \u203a session-metrics.';
-  return { providers: providers.length, models: models, tier: tier, zone: zone, title: title };
+  const boundary = calendar === null ? null : nextBoundary(nowMs, calendar);
+  const scope = providers.length + ' provider(s) and ' + models + ' model(s) are configured.';
+  const title = (calendar !== null
+    ? 'The peak/off-peak state right now, read from the calendar of "' + tierProvider +
+      '" in ' + zone + '. ' + scope
+    : 'No configured provider has peak windows, so every hour is charged at one rate. ' + scope)
+    + ' Set rates on the component row under ' + PLUGIN_ID + ' \u203a ' + SETTINGS_NS + '.';
+  return {
+    providers: providers.length,
+    models: models,
+    tier: tier,
+    zone: zone,
+    tierProvider: tierProvider,
+    boundary: boundary,
+    title: title,
+  };
 }
 
 /**
  * The one child that decides between a real chip and nothing.
  *
- * It takes its `title` from props on purpose: the DOM suite mounts a component
- * with props alone, and a parent that held it in state would also re-render on
- * every revision of the configuration.
+ * It re-reads `Date.now()` in state rather than once per render, and schedules one
+ * timer for `payload.boundary`: a chip whose single claim is "right now" must not
+ * keep claiming the tier it saw when the page first rendered. A flat calendar has
+ * no boundary, so it costs no timer at all.
  */
-class BadgeView extends React.PureComponent<any, any> {
-  render() {
-    const payload = badgePayload(this.props.value, Date.now());
-    if (payload === null) return null;
-    const segments = [
-      payload.providers + (payload.providers === 1 ? ' provider' : ' providers'),
-      payload.models + (payload.models === 1 ? ' model' : ' models'),
-    ];
-    if (payload.tier !== null) segments.push(payload.tier);
-    const children: any[] = [];
-    segments.forEach(function (part, index) {
-      if (index > 0) children.push('\u00b7');
-      if (part === 'peak' || part === 'off-peak') {
-        children.push(h('span', { key: 'tier', className: part === 'peak' ? 'dsm-peak' : 'dsm-off' }, part));
-      } else {
-        children.push(part);
-      }
-    });
-    return h('span', { className: 'dsm-badge', title: payload.title }, children);
-  }
+function BadgeView(props) {
+  const nowState = useState(function () { return Date.now(); });
+  const nowMs = nowState[0];
+  const setNowMs = nowState[1];
+  const payload = badgePayload(props.value, nowMs);
+  const boundary = payload === null ? null : payload.boundary;
+  useEffect(function () {
+    if (boundary === null) return undefined;
+    const wait = Math.max(1000, boundary - Date.now());
+    const timer = window.setTimeout(function () { setNowMs(Date.now()); }, wait);
+    return function () { window.clearTimeout(timer); };
+  }, [nowMs, props.value, boundary]);
+  if (payload === null) return null;
+  const segments = [
+    payload.providers + (payload.providers === 1 ? ' provider' : ' providers'),
+    payload.models + (payload.models === 1 ? ' model' : ' models'),
+  ];
+  if (payload.tier !== null) segments.push(payload.tier);
+  const children: any[] = [];
+  segments.forEach(function (part, index) {
+    if (index > 0) children.push('\u00b7');
+    if (part === 'peak' || part === 'off-peak') {
+      children.push(h('span', { key: 'tier', className: part === 'peak' ? 'dsm-peak' : 'dsm-off' }, part));
+    } else {
+      children.push(part);
+    }
+  });
+  return h('span', { className: 'dsm-badge', title: payload.title }, children);
 }
 
 /**
@@ -425,13 +443,15 @@ class BadgeView extends React.PureComponent<any, any> {
  * The slot hands this component `{ subject }` and standard hooks only — no
  * `getService` — so a badge cannot reach the configuration through props. It is
  * handed a getter captured in the registration closure instead, and the getter
- * is called on **every render** rather than once at registration: the settings
- * service may arrive after this bundle. A service that is missing, null,
- * unreadable or without an entry for this plugin is not an error — it means the
+ * is resolved when the service identity changes, then re-read on every render
+ * through `getSnapshot`: the settings service may arrive after this bundle. A
+ * service that is missing, null or unreadable is not an error — it means the
  * badge has nothing true to say, so it renders nothing.
  *
- * Every step is defensive because this component runs *inside* the slot owner's
- * render: a throw here would abdicate the entry, not merely hide the chip.
+ * Only the *absence* of data is turned into null here. A **throw** is deliberately
+ * left alone: `MetricsBoundary` wraps this component and renders a readable
+ * failure chip, so swallowing an error would only delete the message (see
+ * dsh-plugin-delivery.md, "Make the empty case visible").
  * @param props - slot props plus the `getService` getter `apply` supplies.
  * @returns the badge, or null when there is no real value to show.
  */
@@ -446,37 +466,26 @@ function PluginBadge(props) {
     const found = stableGet('configForms');
     return found === undefined || found === null ? null : found;
   }, [stableGet, getService]);
-  // `ctx.get('configForms')` returns the service itself; `service.get(entry)` returns
-  // this plugin's form. Both are checked at every level: `undefined` and `null` are
-  // both normal on a restricted context, and a deployment without a settings service
-  // simply renders no badge.
+  // `ctx.get('configForms')` returns the service itself; `service.get(namespace)` returns
+  // this plugin's form. `undefined` and `null` are both normal on a restricted context,
+  // and a deployment without a settings service simply renders no badge. A *throw* is not
+  // caught: the boundary wraps this component and shows it.
   const form = useMemo(function () {
     if (service === null || typeof service.get !== 'function') return null;
-    try {
-      const found = service.get(SETTINGS_NS);
-      return found === undefined || found === null ? null : found;
-    } catch (error) {
-      return null;
-    }
+    const found = service.get(SETTINGS_NS);
+    return found === undefined || found === null ? null : found;
   }, [service]);
+  // A form without `subscribe` is absence, not failure: the owner-supplied shape
+  // carries none, and the value still arrives through `getSnapshot`.
   const subscribe = useCallback(function (listener) {
     if (form === null || typeof form.subscribe !== 'function') return function () {};
-    try {
-      const unsubscribe = form.subscribe(listener);
-      return function () {
-        if (typeof unsubscribe === 'function') unsubscribe();
-      };
-    } catch (error) {
-      return function () {};
-    }
+    const unsubscribe = form.subscribe(listener);
+    return function () {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
   }, [form]);
   const getSnapshot = useCallback(function () {
-    if (form === null) return null;
-    try {
-      return badgeValue(form);
-    } catch (error) {
-      return null;
-    }
+    return form === null ? null : badgeValue(form);
   }, [form]);
   const value = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   return value === null ? null : h(BadgeView, { value: value });
@@ -1149,9 +1158,6 @@ const openState = useState(false);
 
 
 // ------------------------------------------------- pricing page (Plugins)
-/** The Loader's entry id for this plugin's row — what the Host's Config inspector takes. */
-const CONFIG_ENTRY = 'include:session-metrics';
-
 /**
  * The settings *namespace* the row serves — the id the bundle's patch declares.
  *
@@ -1159,11 +1165,19 @@ const CONFIG_ENTRY = 'include:session-metrics';
  * `include:session-metrics` returns a controller whose value layer is unavailable, which is
  * indistinguishable from "nothing is configured". The plugin-manager's own row page gates on
  * `view.ns === openRow.rowId`, and the row is `session-metrics`.
+ *
+ * This literal is the client's one copy. The Loader entry id and the `plugins.row.config`
+ * key are derived from it below, and `test/namespace.ts` reads the row id out of
+ * `cordis.patch.yml` so a rename cannot leave the client, the patch and the host disagreeing
+ * silently.
  */
 const SETTINGS_NS = 'session-metrics';
 
+/** The Loader's entry id for this plugin's row — what the Host's Config inspector takes. */
+const CONFIG_ENTRY = 'include:' + SETTINGS_NS;
+
 /** The `plugins.row.config` key: `<bundle>#<rowId>`, as the ledger expects. */
-const ROW_CONFIG_KEY = 'dsh-session-metrics#session-metrics';
+const ROW_CONFIG_KEY = PLUGIN_ID + '#' + SETTINGS_NS;
 
 /** Parse "1-4,6-10" into peak windows. */
 function parseWindows(text) {
@@ -1676,6 +1690,30 @@ function PricingPage(props) {
 }
 
 /**
+ * Whether this plugin has anything to say for the page's subject (T-001).
+ *
+ * `plugins.detail.badge` is a **list** slot and its owner renders *every* entry
+ * on all three detail pages (ItemDetail, RowDetail, BundleDetail) with no filter,
+ * so each entry must decide for itself. The owner's contract is explicit: "an
+ * entry renders null for a subject it has nothing for". We contribute no plugin
+ * item, so only our own bundle or row page qualifies; anything unrecognised —
+ * including a missing `subject` — is a page we do not own.
+ *
+ * Every read is guarded because this runs inside the owner's render, where a
+ * throw would be the owner's failure, not a chip we can show.
+ * @param subject - the page's subject, as the owner passes it.
+ * @returns true only for this plugin's own bundle or row page.
+ */
+function isOurSubject(subject: any) {
+  if (subject === null || subject === undefined) return false;
+  const kind = subject.kind;
+  if (kind !== 'bundle' && kind !== 'row') return false;
+  const pkg = subject.pkg;
+  if (pkg === null || pkg === undefined) return false;
+  return pkg.name === PLUGIN_ID;
+}
+
+/**
  * Register the detail badge beside the plugin title (T-001).
  *
  * One helper so the same contribution can be attached through either door: the
@@ -1696,6 +1734,9 @@ function registerBadge(slots: any, serviceGet: (name: string) => any) {
       order: 20,
       label: 'Session metrics: providers, models and the current peak state',
     }, function (props: any) {
+      // The gate sits outside the boundary on purpose: on another plugin's page
+      // we must render nothing at all, not a failure chip of our own.
+      if (!isOurSubject(props && props.subject)) return null;
       return h(MetricsBoundary, null, h(PluginBadge, Object.assign({}, props, { serviceGet: serviceGet })));
     });
   });
