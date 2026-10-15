@@ -41,6 +41,18 @@ interface LedgerFixture {
   steps: number;
   totals: Record<string, Buckets>;
   rows: LedgerRow[];
+  /** Pairs the ledger observed with no rate card; absent on a pre-discovery checkpoint. */
+  discovered?: DiscoveredFixture[];
+}
+
+/** One observed-but-unpriced pair, as the wire carries it. */
+interface DiscoveredFixture {
+  provider: string;
+  model: string;
+  tokens: number;
+  steps: number;
+  firstSeen: number;
+  lastSeen: number;
 }
 
 /** The resolved settings object, as the module returns it. */
@@ -106,6 +118,48 @@ const ledger: LedgerFixture = {
 
 const selection: SelectionFixture = { lastUsed: { provider: 'deepseek-account', model: 'deepseek-flash' } };
 const usage: Buckets = { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 };
+
+/** The free model `agent-default-model` configures, with one step's real buckets. */
+const FREE_MODEL = 'nvidia/nemotron-3.5-lightning:free';
+const freeBuckets: Buckets = { uncachedInputTokens: 146_120, cacheReadTokens: 1_102_496, cacheWriteTokens: 0, outputTokens: 5_534 };
+const freeSelection: SelectionFixture = { lastUsed: { provider: 'openrouter', model: FREE_MODEL } };
+const freeLedger: LedgerFixture = {
+  turns: 1,
+  steps: 1,
+  totals: { ['openrouter\u0000' + FREE_MODEL + '\u0000flat']: freeBuckets },
+  rows: [{
+    turn: 1, step: 1, startTime: Date.now() - 1000, endTime: Date.now(),
+    provider: 'openrouter', model: FREE_MODEL, tier: 'flat', buckets: freeBuckets,
+  }],
+};
+
+/** One pair the ledger observed with no rate card: OpenRouter's paid router. */
+const discoveredPair: DiscoveredFixture = {
+  provider: 'openrouter', model: 'auto', tokens: 310_956, steps: 2,
+  firstSeen: 1792026000100, lastSeen: 1792026001100,
+};
+
+/** A session that used the paid router: real tokens, no card, so unpriced. */
+const unpricedBuckets: Buckets = { uncachedInputTokens: 22_526, cacheReadTokens: 282_624, cacheWriteTokens: 0, outputTokens: 5_804 };
+const unpricedLedger: LedgerFixture = {
+  turns: 1,
+  steps: 1,
+  totals: { 'openrouter\u0000auto\u0000flat': unpricedBuckets },
+  rows: [{
+    turn: 1, step: 1, startTime: Date.now() - 1000, endTime: Date.now(),
+    provider: 'openrouter', model: 'auto', tier: 'flat', buckets: unpricedBuckets,
+  }],
+  discovered: [discoveredPair],
+};
+
+/** A session that used one priced card and one unpriced pair. */
+const mixedLedger: LedgerFixture = {
+  turns: 1,
+  steps: 2,
+  totals: Object.assign({}, ledger.totals, unpricedLedger.totals),
+  rows: ledger.rows.concat(unpricedLedger.rows),
+  discovered: [discoveredPair],
+};
 
 test('registration: the strip passes only the options its slot declares', () => {
   // `conversation.input.dock` declares `id`, `order`, `label` and nothing else. An
@@ -213,6 +267,24 @@ test('labels: a legacy window/savings config still renders the peak flag, the cl
   }
 });
 
+test('free: a session on the shipped zero-rate card reads $0.00, never unpriced', async () => {
+  // The distinction the whole free-model requirement rests on: a zero-rate card is a real
+  // cost of zero, while a missing card is "unpriced". Rendering it as `unpriced` would say
+  // the plugin does not know the price; rendering it as anything else would invent money.
+  const view = render({ ledger: freeLedger, settings, selection: freeSelection, usage: freeBuckets });
+  try {
+    const text = view.text();
+    assert.match(text, /Cost\$0\.00/, `a free session costs exactly $0.00: ${text}`);
+    assert.equal(text.includes('unpriced'), false, 'and it is not reported as unpriced');
+    await view.clickTrigger();
+    assert.match(view.text(), /Cost breakdown/);
+    assert.match(view.text(), /Total \$0\.00/, 'the breakdown agrees with the strip');
+    assert.equal(view.text().includes('Seen, unpriced'), false, 'a priced free model is not discovered');
+  } finally {
+    view.unmount();
+  }
+});
+
 test('details: four sections, no step table, and the pill figures stay out of it', async () => {
   const view = render({ ledger, settings, selection, usage });
   try {
@@ -229,6 +301,7 @@ test('details: four sections, no step table, and the pill figures stay out of it
     assert.equal(text.includes('Rate window'), false, 'renamed to Timezone');
     assert.equal(text.includes('Sources'), false, 'the sources section is gone');
     assert.equal(text.includes('Rates as of'), false, 'rates-as-of was dropped');
+    assert.equal(text.includes('Seen, unpriced'), false, 'a ledger with no discovery renders no discovery section');
     // build id and provenance moved onto the heading, reachable on hover
     const heading = view.container.querySelector('.dsm-title span');
     const headingTitle = heading === null ? '' : heading.getAttribute('title') || '';
@@ -324,6 +397,45 @@ test('details: the timezone section reports both clocks, one local sentence, no 
     assert.equal(/01:00\u201304:00/.test(text), false, 'the provider-zone window list is gone');
     assert.match(text, /Ongoing|Next in|None/, 'a short peak state');
     assert.equal(/starts in .* \u2014 at /.test(text), false, 'and no redundant countdown note');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('discovery: the detail names every observed unpriced pair, with tokens and no cost', async () => {
+  const view = render({ ledger: unpricedLedger, settings, selection: { lastUsed: { provider: 'openrouter', model: 'auto' } }, usage: unpricedBuckets });
+  try {
+    assert.match(view.text(), /Costunpriced/, 'the strip refuses to price the pair');
+    await view.clickTrigger();
+    const text = view.text();
+    assert.match(text, /Seen, unpriced/, 'the section says what it is');
+    assert.match(text, /openrouter \u00b7 auto/, 'and names the pair that was seen');
+    assert.match(text, /unpriced/, 'and labels it unpriced');
+    const item = [...view.container.querySelectorAll('.dsm-list li')]
+      .find((node) => (node.textContent || '').includes('openrouter \u00b7 auto'));
+    assert.ok(item !== undefined, 'the pair is listed');
+    assert.equal((item!.textContent || '').includes('$'), false, 'a discovered pair is never given a cost');
+    assert.match(item!.textContent!, /tokens/, 'the observed tokens are shown instead');
+    assert.match(text, /no rate card matches/i, 'and the cost section says why there is no total');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('discovery: an unpriced model row says unpriced while a priced row is untouched', async () => {
+  const view = render({ ledger: mixedLedger, settings, selection, usage });
+  try {
+    await view.clickTrigger();
+    const rows = [...view.container.querySelectorAll('.dsm-table tbody tr')];
+    assert.equal(rows.length, 2, 'one row per provider/model');
+    const cells = rows.map((row) => [...row.querySelectorAll('td')].map((node) => node.textContent));
+    assert.deepEqual(cells.map((row) => row.length), [3, 3], 'the table keeps its three columns');
+    const priced = cells.find((row) => row[0] === 'deepseek-account');
+    const unpriced = cells.find((row) => row[0] === 'openrouter');
+    assert.ok(priced !== undefined && unpriced !== undefined, `both rows render: ${JSON.stringify(cells)}`);
+    assert.equal(priced![1], 'DeepSeek V4.1 Flash', 'a priced row shows its card label and nothing else');
+    assert.equal(priced![1].includes('unpriced'), false, 'and never says unpriced');
+    assert.equal(unpriced![1].includes('unpriced'), true, `an unpriced row says so visibly: ${unpriced![1]}`);
   } finally {
     view.unmount();
   }

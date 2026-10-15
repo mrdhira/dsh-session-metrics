@@ -38,6 +38,15 @@ revision it read when editing began.
 - **Match by exact provider id**, then by model id or alias. A provider or model
   with no card reports **`unpriced`**: tokens are still shown, no cost is
   invented, and the strip never renders a fabricated `$0.0000`.
+- **A free model needs a card of zeros, not the absence of a card.** `'0'` in
+  every bucket is a rate that parses to 0 nanodollars, so a free session prices to
+  exactly `$0.00`. An omitted card leaves `ratesAt` null, `priceBuckets` null and
+  the strip reading `unpriced` — the same word a genuinely unknown provider gets,
+  which would say "we do not know" about a model whose price is known to be zero.
+- **Never ship a guessed paid rate.** The profile's model catalog lists ids, names
+  and context windows, and no prices; a number invented for a paid model would be
+  a fabricated bill. Paid models therefore ship without a card and are reported
+  and discovered instead (below).
 - **Never subtract the cached count from the input count.** DSH already does it:
   measured across every session available, `totalTokens = inputTokens +
   cacheReadTokens + cacheWriteTokens + outputTokens` exactly. `inputTokens` *is*
@@ -48,6 +57,36 @@ revision it read when editing began.
   `JSON.stringify` cannot carry.
 - `cacheWrite` defaults to the cache-miss rate when not stated.
 
+## Discovery: an unconfigured pair is never invisible
+
+A pair with no card is reported as `unpriced` in the strip and in the model
+table, but that alone is a dead end: nothing on a configuration-only screen knows
+which pairs have actually been seen, and the Pricing page cannot read session
+data. So the host ledger keeps a second, small list.
+
+- **Recorded where usage is attributed**, not at `request/header`: a header is a
+  request that may never be billed, while a reported bucket set is spend that
+  really happened and really cannot be priced.
+- **Deduped by pair** and **bounded** (32 pairs): each row carries the pair, the
+  total tokens seen, the number of reports, and the first/last instants. The first
+  pairs observed are the ones kept when the bound is reached.
+- **Exposed on the existing projection** as `ledger.discovered` — same
+  `sessionMetrics` channel, no new service and no change to any existing config
+  field. The wire schema carries it, so a malformed row is refused at the
+  boundary.
+- **Surfaced in the detail panel** as a *Seen, unpriced* section listing each pair
+  with its token count and the word `unpriced`, and as a visible `unpriced` marker
+  on the model-table row. The section renders only when the list is non-empty, so
+  a fully priced session looks exactly as it did.
+- **Never rendered as a cost.** Discovery rows show tokens, never money: there is
+  no rate to apply, and a zero would be a claim about a price nobody knows.
+
+A pair with a card — including a free one at zero — is priced and therefore *not*
+discovered. That is the difference the tests pin: a free session reads `$0.00`
+and has an empty discovery list; a session on an integrated-but-unpriced pair
+reads `unpriced` and appears under *Seen, unpriced*.
+
+
 ## Shipped defaults
 
 | Provider | Model | cacheHit | cacheMiss | output | Window |
@@ -57,6 +96,26 @@ revision it read when editing began.
 | `deepseek-official` | same two cards | | | | peak, off-peak x0.5 |
 | `netra-runtime` | `deepseek/deepseek-v4.1-flash` | 0.01 | 0.10 | 0.25 | flat |
 | `netra-runtime` | `deepseek/deepseek-v4-flash-0731` | 0.01 | 0.10 | 0.25 | flat |
+| `openrouter` | the 19 `:free` catalog models, plus `free` (`openrouter/free`) | 0 | 0 | 0 | flat |
+
+### Why OpenRouter ships only free cards
+
+The profile's `llm-pi-ai` catalog lists ~200 OpenRouter models with `id`, `name`,
+`contextWindow` and `maxTokens` — and **no prices**. The only price signal it
+carries is the provider's own free designation: the `:free` id suffix and the
+`"(free)"` display name. Those 19 models (for example
+`nvidia/nemotron-3.5-lightning:free`, the model `agent-default-model` configures)
+ship a zero card, so a session on one prices to exactly `$0.00`.
+
+The paid models deliberately ship no card. Their rates are not in the profile,
+and a guessed number would be a fabricated bill; instead a session that used one
+is reported `unpriced` and listed under *Seen, unpriced* (above), which is what
+the discovery list exists for.
+
+`free` is the provider's own free-models router: the catalog calls it
+`openrouter/free`, while the request header strips the provider prefix (the same
+session data records the catalog's `openrouter/auto` as the wire model `auto`),
+so the card answers to both spellings.
 
 ### Why Netra uses 0.10 / 0.01 / 0.25
 

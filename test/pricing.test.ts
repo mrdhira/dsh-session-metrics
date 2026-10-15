@@ -139,6 +139,8 @@ const CARD_CASES: CardCase[] = [
   ['an exact model id resolves', ['deepseek-account', 'deepseek-flash'], 'deepseek-flash'],
   ['an alias resolves to its card', ['deepseek-account', 'deepseek-v4.1-flash'], 'deepseek-flash'],
   ['a slashed id resolves against its own provider', ['netra-runtime', 'deepseek/deepseek-v4.1-flash'], 'deepseek/deepseek-v4.1-flash'],
+  ['the integrated free model resolves', ['openrouter', 'nvidia/nemotron-3.5-lightning:free'], 'nvidia/nemotron-3.5-lightning:free'],
+  ['the free router resolves by its catalog id', ['openrouter', 'openrouter/free'], 'free'],
 ];
 
 const UNKNOWN_CARD_CASES: UnknownCardCase[] = [
@@ -270,6 +272,27 @@ test('price: the four buckets are priced separately and summed', () => {
   assert.equal(price.totalNano, price.cacheHitNano + price.cacheMissNano + price.cacheWriteNano + price.outputNano,
     'the total is their sum, with no hidden term');
   assert.equal(bucketTotal(buckets), 376_327, 'and the token total counts every bucket');
+});
+
+test('price: a free card costs exactly zero in every bucket, and is a card rather than "unpriced"', () => {
+  // The distinction this pins is the whole free-model requirement: no card means
+  // `priceBuckets` returns null and the strip says `unpriced`; a zero card means a real
+  // cost of 0, which the strip rounds to `$0.00`.
+  const card = findCard(settings.providers, 'openrouter', 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(card.model === null, false, 'the free model resolves a card');
+  assert.equal(card.provider === null, false, 'under its own provider');
+  const rates = ratesAt(card.model, FLAT);
+  assert.equal(rates === null, false, 'zero rates are still rates');
+  const buckets = { uncachedInputTokens: 146_120, cacheReadTokens: 1_102_496, cacheWriteTokens: 0, outputTokens: 5_534 };
+  const free = priceBuckets(rates, buckets);
+  assert.equal(free === null, false, 'a priced session, not an unpriced one');
+  assert.equal(free!.totalNano, 0, 'every bucket prices to zero');
+  assert.equal(formatUsd(free!.totalNano, 4), '0.0000', 'and renders as a real zero');
+  assert.equal(savingsNano(rates, buckets), 0, 'nothing was saved: the miss rate is zero too');
+  // The same buckets on a paid card are not zero, so the free row cannot pass vacuously.
+  const paid = priceBuckets(ratesAt(flash, PEAK), buckets);
+  assert.equal(paid!.totalNano > 0, true, 'a paid card costs what it always did');
+  assert.notEqual(free!.totalNano, paid!.totalNano, 'free and paid are distinguishable');
 });
 
 test('savings: the gap between the miss and the hit rate, on the cached tokens only', () => {

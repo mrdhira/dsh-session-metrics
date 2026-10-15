@@ -78,23 +78,23 @@ const RESOLUTION_CASES: ResolutionCase[] = [
   {
     name: 'an absent config object resolves to the shipped defaults',
     input: undefined,
-    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime'], problems: 0 },
+    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter'], problems: 0 },
   },
   {
     name: 'null behaves like absent',
     input: null,
-    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime'], problems: 0 },
+    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter'], problems: 0 },
   },
   {
     name: 'an empty object resolves to the shipped defaults',
     input: {},
-    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime'], problems: 0 },
+    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter'], problems: 0 },
   },
   {
     name: 'omitting providers keeps the shipped cards',
     input: { display: { currency: 'CNY', usdToCny: 7.25, primaryProvider: 'netra-runtime', labels: ['cost'] }, budget: { sessionUsd: 5, warnAt: 0.5 } },
     want: {
-      providers: ['deepseek-account', 'deepseek-official', 'netra-runtime'],
+      providers: ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter'],
       problems: 0,
       display: { currency: 'CNY', usdToCny: 7.25, primaryProvider: 'netra-runtime', labels: ['cost'] },
       budget: { sessionUsd: 5, warnAt: 0.5 },
@@ -126,7 +126,7 @@ const LENIENCY_CASES: LeniencyCase[] = [
   {
     name: 'one malformed scalar falls back without losing its siblings',
     input: { display: { currency: 'EUR' }, budget: { sessionUsd: 3 } },
-    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime'], problem: /^display:/, currency: 'USD', sessionUsd: 3 },
+    want: { providers: ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter'], problem: /^display:/, currency: 'USD', sessionUsd: 3 },
   },
   {
     name: 'a duplicate provider id is ignored, with a recorded problem',
@@ -137,7 +137,7 @@ const LENIENCY_CASES: LeniencyCase[] = [
 
 test('defaults: the shipped cards and settings resolve with no problems', () => {
   const settings = resolveSettings({});
-  assert.deepEqual(ids(settings), ['deepseek-account', 'deepseek-official', 'netra-runtime']);
+  assert.deepEqual(ids(settings), ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter']);
   assert.deepEqual(settings.problems, []);
   assert.equal(settings.version, 1);
   assert.deepEqual(settings.display.labels, ['peak', 'time', 'cost', 'saved', 'provider'], 'the label set the strip ships with');
@@ -175,6 +175,39 @@ test('rates: a shipped peak provider is peak/off-peak, and a flat provider decla
   assert.equal(netra.models[0].mode, 'flat');
   assert.equal(netra.models[0].rates.peak, null, 'a flat card has no peak row');
   assert.deepEqual(netra.billing.windows, [], 'and no peak concept');
+});
+
+/**
+ * Provider/model pairs the shipped OpenRouter catalog must price, and the free
+ * designation that justifies a zero rate. The paid models deliberately have no
+ * card: the profile lists ids, not prices, so a paid rate would be invented.
+ */
+const FREE_MODEL_CASES: Array<[model: string, why: string]> = [
+  ['nvidia/nemotron-3.5-lightning:free', 'the model agent-default-model configures'],
+  ['qwen/qwen3.8-27b:free', 'another :free catalog entry'],
+  ['free', 'the provider\u2019s own free-models router'],
+];
+
+test('free: OpenRouter ships a zero-rate card for the models its catalog marks free', () => {
+  const settings = resolveSettings({});
+  const openrouter = settings.providers.find((provider: any) => provider.id === 'openrouter');
+  assert.ok(openrouter !== undefined, 'the provider this profile integrates must be shipped');
+  assert.deepEqual(openrouter.billing.windows, [], 'OpenRouter has no peak concept: flat rates only');
+  for (const [model, why] of FREE_MODEL_CASES) {
+    const card = openrouter.models.find((entry: any) => entry.model === model || (entry.aliases ?? []).includes(model));
+    assert.ok(card !== undefined, `${why}: ${model} must have a card`);
+    assert.equal(card.mode, 'flat', `${model} is a flat card`);
+    // A card whose flat row is null is a *missing* card by another name, and would render
+    // `unpriced`; zero in every bucket is a real cost of exactly $0.00.
+    assert.deepEqual(card.rates.flat, { cacheHit: 0, cacheMiss: 0, cacheWrite: 0, output: 0 }, `${model} must be zero-rated`);
+    assert.equal(card.rates.peak, null, `${model}: a free card has no peak row`);
+  }
+  // Non-vacuity guard on the shipped table itself: every OpenRouter card is either a
+  // `:free` catalog id or the free router. A paid model with a made-up rate fails here.
+  for (const card of openrouter.models) {
+    assert.ok(card.model.endsWith(':free') || card.model === 'free',
+      `${card.model} is a paid model; paid rates are not in the profile and must stay absent`);
+  }
 });
 
 test('leniency: a bad field degrades to a usable configuration and names itself', () => {

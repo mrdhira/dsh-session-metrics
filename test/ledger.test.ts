@@ -15,6 +15,8 @@ import assert from 'node:assert/strict';
 
 import { initLedgerState, createLedgerApply, toLedgerView, groupKey, bucketsFrom } from '../lib/v1/ledger.js';
 import { sessionMetricsWireSchema } from '../lib/v1/schema.js';
+import { resolveSettings } from '../lib/v1/settings.js';
+import { findCard } from '../lib/v1/pricing.js';
 
 /** The four billing buckets a usage report normalizes into. */
 interface Buckets {
@@ -96,6 +98,17 @@ type BucketCase = [name: string, usage: UsageReport | null, want: Buckets | null
 const BASE = Date.parse('2026-10-15T01:00:00Z');
 const peakKey = groupKey('deepseek-account', 'deepseek-flash', 'peak');
 const fold = createLedgerApply({ tierFor: () => 'peak' });
+
+/**
+ * A fold backed by the **shipped** cards, so "configured" means what the plugin really
+ * ships: `openrouter`'s free models have zero-rate cards and are therefore priced at
+ * `$0.00` rather than discovered, while its paid models have none and are discovered.
+ */
+const shippedSettings = resolveSettings({});
+const discoveryFold = createLedgerApply({
+  tierFor: () => 'flat',
+  hasCard: (provider: any, model: any) => findCard(shippedSettings.providers, provider, model).model !== null,
+});
 
 /** Drive a sequence of events through the fold. */
 function run(events: SessionEvent[], apply: LedgerApply = fold): LedgerState {
@@ -230,13 +243,89 @@ const FOLD_CASES: FoldCase[] = [
   },
 ];
 
+/** One pair the discovery list records, as the wire view reports it. */
+interface DiscoveredWant {
+  provider: string | null;
+  model: string | null;
+  tokens: number;
+  steps: number;
+}
+
+/** One event sequence and the unpriced pairs it must record. */
+interface DiscoveryCase {
+  name: string;
+  events: () => SessionEvent[];
+  want: DiscoveredWant[];
+}
+
+/**
+ * Discovery cases, in code-flow order: pairs with no card are recorded; pairs with a
+ * card — including a zero-rate free one — are not; and the list stays bounded.
+ */
+const DISCOVERY_CASES: DiscoveryCase[] = [
+  {
+    name: 'a pair with no card is recorded once, deduped, with its tokens summed',
+    events: () => [
+      ...step({ time: BASE, provider: 'openrouter', model: 'auto', usage: { inputTokens: 100, outputTokens: 10 } }),
+      ...step({ step: 2, time: BASE + 1000, provider: 'openrouter', model: 'auto', usage: { inputTokens: 50, cacheReadTokens: 25 } }),
+    ],
+    want: [{ provider: 'openrouter', model: 'auto', tokens: 185, steps: 2 }],
+  },
+  {
+    name: 'the biggest unpriced spend is listed first',
+    events: () => [
+      ...step({ time: BASE, provider: 'openrouter', model: 'auto', usage: { inputTokens: 10, outputTokens: 1 } }),
+      ...step({ step: 2, time: BASE + 1000, provider: 'openrouter', model: 'anthropic/claude-opus-4.7', usage: { inputTokens: 10_000, outputTokens: 1_000 } }),
+    ],
+    want: [
+      { provider: 'openrouter', model: 'anthropic/claude-opus-4.7', tokens: 11_000, steps: 1 },
+      { provider: 'openrouter', model: 'auto', tokens: 11, steps: 1 },
+    ],
+  },
+  {
+    name: 'a configured pair is not discovered',
+    events: () => step({ time: BASE, usage: { inputTokens: 100, outputTokens: 10 } }),
+    want: [],
+  },
+  {
+    name: 'a free model with a zero-rate card is priced, not discovered',
+    events: () => step({ time: BASE, provider: 'openrouter', model: 'nvidia/nemotron-3.5-lightning:free', usage: { inputTokens: 100, outputTokens: 10 } }),
+    want: [],
+  },
+  {
+    name: 'an unknown model under a configured provider is discovered',
+    events: () => step({ time: BASE, provider: 'deepseek-account', model: 'nope', usage: { inputTokens: 100, outputTokens: 10 } }),
+    want: [{ provider: 'deepseek-account', model: 'nope', tokens: 110, steps: 1 }],
+  },
+  {
+    name: 'a step that reports no usage discovers nothing',
+    events: () => [
+      { type: 'request/header', time: BASE, data: { header: { config: { provider: 'openrouter', model: 'auto' } } } },
+      { type: 'step/start', time: BASE, data: { turn: 1, step: 1 } },
+      { type: 'step/end', time: BASE + 100, data: { turn: 1, step: 1 } },
+    ],
+    want: [],
+  },
+  {
+    name: 'the list is bounded: more unpriced pairs than the limit keeps the first ones',
+    events: () => {
+      const events: SessionEvent[] = [];
+      for (let index = 0; index < 40; index += 1) {
+        // Zero-padded so the expected order is explicit: the view sorts by spend and
+        // then by the pair key, which for equal spend is a string order.
+        events.push(...step({ step: index + 1, time: BASE + index * 1000, provider: 'some-router', model: `model-${String(index).padStart(2, '0')}`, usage: { inputTokens: 1, outputTokens: 1 } }));
+      }
+      return events;
+    },
+    want: Array.from({ length: 32 }, (_, index) => ({ provider: 'some-router', model: `model-${String(index).padStart(2, '0')}`, tokens: 2, steps: 1 })),
+  },
+];
+
 test('buckets: a usage report normalizes into the four billing buckets', () => {
   for (const [name, usage, want] of BUCKET_CASES) {
     assert.deepEqual(bucketsFrom(usage), want, name);
   }
-});
-
-test('fold: every event sequence folds into the expected rows and totals', () => {
+});test('fold: every event sequence folds into the expected rows and totals', () => {
   for (const { name, events, apply = fold, want } of FOLD_CASES) {
     const state = run(events(), apply);
     if (want.steps !== undefined) assert.equal(state.steps, want.steps, `${name}: steps`);
@@ -263,6 +352,22 @@ test('fold: every event sequence folds into the expected rows and totals', () =>
     }
     if (want.totals) assert.deepEqual(state.totals, want.totals, `${name}: totals`);
   }
+});
+
+test('discovery: unpriced pairs are recorded once, deduped, bounded and priced nowhere', () => {
+  for (const { name, events, want } of DISCOVERY_CASES) {
+    const state = run(events(), discoveryFold);
+    const view = toLedgerView(state);
+    const got = view.discovered.map((entry: any) => ({
+      provider: entry.provider, model: entry.model, tokens: entry.tokens, steps: entry.steps,
+    }));
+    assert.deepEqual(got, want, name);
+  }
+  // A discovered pair still has its tokens banked: the client can say what was seen even
+  // though it refuses to price it.
+  const state = run(step({ time: BASE, provider: 'openrouter', model: 'auto', usage: { inputTokens: 7, outputTokens: 3 } }), discoveryFold);
+  assert.deepEqual(Object.keys(state.totals), [groupKey('openrouter', 'auto', 'flat')], 'the tokens still land in totals');
+  assert.equal(toLedgerView(state).discovered[0].tokens, 10, 'and the discovery row counts them');
 });
 
 test('wire: the projected view is JSON-safe and schema-valid', () => {
@@ -297,9 +402,24 @@ test('wire: a view with an unexpected field or a bad row is rejected', () => {
       providers: [],
       problems: [],
     },
-    ledger: { turns: 0, steps: 0, totals: {}, rows: [] },
+    ledger: {
+      turns: 0, steps: 0, totals: {}, rows: [], discovered: [],
+    },
   };
   assert.doesNotThrow(() => sessionMetricsWireSchema.parse(valid), 'the control view is valid');
   assert.throws(() => sessionMetricsWireSchema.parse({ ...valid, surprise: true }), /is not a known field/);
   assert.throws(() => sessionMetricsWireSchema.parse({ ...valid, ledger: { ...valid.ledger, rows: [{ turn: 'x' }] } }), /must be a number/);
+  // `discovered` is part of the contract, so a malformed row must be refused rather than
+  // reaching the client and rendering an invented pair.
+  assert.throws(
+    () => sessionMetricsWireSchema.parse({ ...valid, ledger: { ...valid.ledger, discovered: [{ provider: 'x', model: 'y', tokens: 'lots' }] } }),
+    /must be a number/,
+  );
+  assert.doesNotThrow(
+    () => sessionMetricsWireSchema.parse({
+      ...valid,
+      ledger: { ...valid.ledger, discovered: [{ provider: 'openrouter', model: 'auto', tokens: 10, steps: 1, firstSeen: null, lastSeen: null }] },
+    }),
+    'a well-formed discovery row is valid',
+  );
 });

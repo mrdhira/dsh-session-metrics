@@ -107,6 +107,8 @@ const STYLES = [
   '.dsm-summary{font-size:1.09em;color:var(--dsw-alias-label-tertiary)}',
   '.dsm-list{margin:4px 0 0;padding-left:16px;font-size:1em;color:var(--dsw-alias-label-secondary)}',
   '.dsm-pre{margin:0;padding:8px;border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-fill-tsp-secondary);font-size:0.91em;line-height:14px;overflow:auto;max-height:220px}',
+  // Declared last on purpose: it must win over `.dsm-tag`/`.dsm-warn` at equal specificity.
+  '.dsm-unpriced{color:var(--dsw-alias-state-warning-primary,#b7791f);font-weight:600}',
 ].join('');
 
 if (typeof document !== 'undefined' && document.querySelector('style[data-plugin-css="' + NS + '"]') === null) {
@@ -952,6 +954,9 @@ const openState = useState(false);
     const sections = [];
 
     const groups = priced ? priced.groups : [];
+    // Pairs the ledger actually observed with no rate card. An older checkpoint
+    // carries no `discovered` field at all, so it is read as an empty list.
+    const discovered = Array.isArray(ledger.discovered) ? ledger.discovered : [];
     const sumNano = function (pick) {
       return groups.reduce(function (total, group) { return total + (group.price ? pick(group.price) : 0); }, 0);
     };
@@ -1068,7 +1073,9 @@ const openState = useState(false);
                     + (row.priced ? '\nCost ' + usd2(row.nano) + ' \u00b7 ' + tokens(row.tokens) + ' tokens' : '\nunpriced'),
                 },
                   h('td', null, row.provider || 'unknown'),
-                  h('td', null, modelName),
+                  // The word, not only a tooltip: an unpriced row states it where a
+                  // reader sees it, and it never borrows a number it does not have.
+                  h('td', null, modelName, row.priced ? null : h('span', { className: 'dsm-unpriced' }, ' \u00b7 unpriced')),
                   h('td', null, state));
               }))),
             modelRows.length > shown.length
@@ -1077,6 +1084,30 @@ const openState = useState(false);
             priced && !priced.priced
               ? h('div', { className: 'dsm-note dsm-warn' }, 'At least one of these has no rate card, so its cost is not counted.')
               : null));
+        }
+
+        if (details.indexOf('models') >= 0 && discovered.length > 0) {
+          // Auto-discovery: a provider or model integrated after this plugin shipped has
+          // no card, and nothing on a configuration-only screen would ever mention it. The
+          // ledger recorded the pairs as they were used, so the session itself names them
+          // — with the tokens seen and the word `unpriced`, never an invented cost.
+          const listed = discovered.slice(0, 8);
+          sections.push(h('div', { key: 'discovered' },
+            h('div', { className: 'dsm-section' }, 'Seen, unpriced'),
+            h('ul', { className: 'dsm-list' }, listed.map(function (entry: any, index: number) {
+              const provider = entry && entry.provider ? entry.provider : 'unknown provider';
+              const model = entry && entry.model ? entry.model : 'unknown model';
+              const seen = entry && typeof entry.tokens === 'number' ? tokens(entry.tokens) + ' tokens' : 'no tokens';
+              return h('li', { key: index },
+                h('b', null, provider + ' \u00b7 ' + model),
+                ' \u2014 ' + seen + ', no rate card: ',
+                h('b', { className: 'dsm-unpriced' }, 'unpriced'));
+            })),
+            discovered.length > listed.length
+              ? h('div', { className: 'dsm-note' }, 'plus ' + (discovered.length - listed.length) + ' more unpriced pairs')
+              : null,
+            h('div', { className: 'dsm-note' }, 'No cost is counted for these. Add a rate card on this plugin\u2019s component row under '
+              + PLUGIN_ID + ' to price them; a provider\u2019s free models cost $0.00 and need a zero-rate card.')));
         }
 
         if (details.indexOf('window') >= 0 && billing) {
@@ -1656,7 +1687,8 @@ function PricingPage(props) {
       h('span', { className: 'dsm-tag' }, providers.length + ' providers')),
     h('div', { className: 'dsm-note' },
       'Rates used to price this session, per provider and per model \u2014 these are the ones on this machine right now. A session whose provider or model has no card is reported as ',
-      h('b', null, 'unpriced'), ' rather than guessed.'),
+      h('b', null, 'unpriced'), ' rather than guessed; the session\u2019s own detail lists the pairs it saw under ',
+      h('b', null, 'Seen, unpriced'), ', and adding their card here prices them. A provider\u2019s free models need a zero-rate card to read $0.00.'),
     showingInherited
       ? h('div', { className: 'dsm-note' }, 'These are the inherited rates; saving writes your own over them.')
       : null,

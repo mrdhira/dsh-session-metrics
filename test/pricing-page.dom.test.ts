@@ -107,12 +107,13 @@ test('page: lists every integrated provider with its models', () => {
   const view = renderPage(configFormsFor(form));
   try {
     const text = view.text();
-    assert.equal(view.container.querySelectorAll('.dsm-card').length, 3, 'one card per shipped provider');
-    for (const id of ['deepseek-account', 'deepseek-official', 'netra-runtime']) {
+    assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, 'one card per shipped provider');
+    for (const id of ['deepseek-account', 'deepseek-official', 'netra-runtime', 'openrouter']) {
       assert.ok(text.includes(id), `expected provider ${id} in the page`);
     }
     assert.ok(text.includes('deepseek-flash'), 'expected the model rows');
     assert.ok(text.includes('deepseek/deepseek-v4.1-flash'), 'expected netra models too');
+    assert.ok(text.includes('nvidia/nemotron-3.5-lightning:free'), 'and the free OpenRouter card');
     // The id `configForms` is keyed by is the settings NAMESPACE (the id the bundle's patch
     // declares), not the Loader's entry id. Asserting the wrong one is the bug this pins: the
     // entry id returns a controller whose value layer is unavailable, so the page would look
@@ -121,6 +122,22 @@ test('page: lists every integrated provider with its models', () => {
     assert.equal(namespacesSeen.length > 0, true, 'the page asked the service for a namespace');
     assert.deepEqual([...new Set(namespacesSeen)], [ROW_ID], 'the page asks only for the settings namespace');
     assert.equal(namespacesSeen.includes('include:' + ROW_ID), false, 'never the Loader entry id');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('page: the OpenRouter free card is editable and shows a real zero, not an empty rate', () => {
+  // A free model needs a card of zeros so the strip can say `$0.00`; a card with empty
+  // fields would save as an invalid rate and leave the session unpriced.
+  const form = makeForm();
+  const view = renderPage(configFormsFor(form));
+  try {
+    const row = [...view.container.querySelectorAll('.dsm-modelRow')]
+      .find((node) => node.querySelector<HTMLInputElement>('.dsm-inputModel')?.value === 'nvidia/nemotron-3.5-lightning:free');
+    assert.ok(row !== undefined, 'the free model has a row');
+    const rates = [...row!.querySelectorAll<HTMLInputElement>('.dsm-rates input')].map((node) => node.value);
+    assert.deepEqual(rates, ['0', '0', '0', '0'], 'zero in every bucket, in the USD form the schema accepts');
   } finally {
     view.unmount();
   }
@@ -202,14 +219,14 @@ test('page: adding and removing providers and models edits the draft', async () 
   const view = renderPage(configFormsFor(form));
   try {
     await view.clickNode(view.control('+ provider')!);
-    assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, 'a new provider card appears');
+    assert.equal(view.container.querySelectorAll('.dsm-card').length, 5, 'a new provider card appears');
     assert.match(view.text(), /new-provider/);
 
     await view.clickNode(view.control('+ model')!);
     assert.match(view.text(), /new-model/);
 
     await view.clickNode([...view.container.querySelectorAll('.dsm-cardHead .dsm-toggle')].find((node) => node.textContent === 'remove')!);
-    assert.equal(view.container.querySelectorAll('.dsm-card').length, 3, 'removing a provider drops its card');
+    assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, 'removing a provider drops its card');
   } finally {
     view.unmount();
   }
@@ -269,7 +286,7 @@ test('page: an unaccepted value falls back to the inherited base so the editor s
   const loaded = loadBundle();
   const view = mount(loaded, loaded.slot('plugins.row.config'), { view: 'page', form: ownerForm });
   try {
-    assert.equal(view.container.querySelectorAll('.dsm-card').length, 3, 'the shipped cards render from base');
+    assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, 'the shipped cards render from base');
     assert.match(view.text(), /inherited rates/, 'and says the rates are inherited');
   } finally {
     view.unmount();
@@ -368,7 +385,7 @@ test('page: the summary view is a one-liner with no editor', () => {
   const loaded = loadBundle();
   const view = mount(loaded, loaded.slot('plugins.row.config'), { view: 'summary' });
   try {
-    assert.match(view.text(), /3 providers/);
+    assert.match(view.text(), /4 providers/);
     assert.match(view.text(), /models/);
     assert.equal(view.container.querySelectorAll('.dsm-card').length, 0, 'the summary half renders no editor');
     assert.ok(view.container.querySelector('.dsm-primary') === null);
@@ -478,7 +495,7 @@ test('robustness: every partial config shape the Host can serve renders without 
         assert.match(text, /No rate cards are configured/, 'an empty card set explains itself');
       }
       if (label === 'base only') {
-        assert.equal(view.container.querySelectorAll('.dsm-card').length, 3, `${label} renders the inherited cards`);
+        assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, `${label} renders the inherited cards`);
       }
     } finally {
       view.unmount();

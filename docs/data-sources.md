@@ -24,7 +24,7 @@ percentage or composition, turns, steps, or tok/s.
 |---|---|---|
 | `tokenUsage` | `@deepseek-ai/dsh-token-meter` | `uncachedInputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens` |
 | `modelSelection` | session controller | `lastUsed.provider`, `lastUsed.model` |
-| `sessionMetrics` | **this plugin** | session cost inputs: per-step ledger rows and `provider · model · tier` bucket groups |
+| `sessionMetrics` | **this plugin** | session cost inputs: per-step ledger rows, `provider · model · tier` bucket groups, and `discovered` — the pairs used with no rate card |
 
 Projections this plugin deliberately does **not** read: `sessionStats`,
 `contextPressure`, `contextBreakdown` — the pills own those.
@@ -142,13 +142,14 @@ default.
 The model name and the build tag were removed from the strip: the model is in the detail's
 Model provider table, and the build id is in the detail footer.
 
-## The detail panel: four sections and a footer
+## The detail panel: four sections, a discovery list and a footer
 
 | section | columns | source |
 |---|---|---|
 | Cost breakdown | `Input` = uncached input **+** cache writes, `Output`, `Cached`; each with its cost, its token count, and a three-segment bar | `tokenUsage` buckets priced per ledger group |
 | Saving breakdown | `Saved` (cached tokens × rate difference), `Blended rate` (total cost ÷ total tokens), `From cache reads` (cached cost ÷ total) | the priced groups |
-| Model provider | `provider`, `model`, `peak hours` = `On` / `Off` / `None` (flat) | ledger groups × the rate cards' billing calendars |
+| Model provider | `provider`, `model`, `peak hours` = `On` / `Off` / `None` (flat); an unpriced row also shows `unpriced` | ledger groups × the rate cards' billing calendars |
+| Seen, unpriced (only when non-empty) | `provider · model` and the tokens seen, labelled `unpriced` — never a cost | `ledger.discovered`, the pairs observed with no rate card |
 | Timezone | `Local time`, `Provider time`, `Peak hours` = `None — flat rate` / `Peak hours ongoing` / `Next peak in 2h 11m` | `billing.timezone` and the viewer zone |
 | footer | build id, and the sources or any config problems | — |
 

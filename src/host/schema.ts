@@ -72,6 +72,21 @@ const buckets = z.object({
   outputTokens: z.number(),
 });
 
+/**
+ * One observed provider/model pair with no rate card.
+ *
+ * `tokens` is the sum of the buckets attributed to the pair; it is evidence of
+ * how much went unpriced, never a cost — a pair without a card has no rate.
+ */
+const discoveredPair = z.object({
+  provider: z.union([z.string(), z.null()]),
+  model: z.union([z.string(), z.null()]),
+  tokens: z.number(),
+  steps: z.number(),
+  firstSeen: z.union([z.number(), z.null()]),
+  lastSeen: z.union([z.number(), z.null()]),
+});
+
 /** The full client-visible value. */
 export const sessionMetricsWireSchema = z.object({
   version: z.number(),
@@ -95,5 +110,6 @@ export const sessionMetricsWireSchema = z.object({
     steps: z.number(),
     totals: z.record(buckets),
     rows: z.array(ledgerRow),
+    discovered: z.array(discoveredPair),
   }),
 });

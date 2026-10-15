@@ -25,8 +25,9 @@ import { execFileSync } from 'node:child_process';
 
 import { createLedgerApply, initLedgerState, toLedgerView, groupKey } from '../lib/v1/ledger.js';
 import { resolveSettings } from '../lib/v1/settings.js';
-import { tierAt } from '../lib/v1/pricing.js';
+import { findCard, priceBuckets, ratesAt, tierAt } from '../lib/v1/pricing.js';
 import { sessionMetricsWireSchema } from '../lib/v1/schema.js';
+import { loadBundle, mount } from './harness.ts';
 
 /** The four billing buckets a usage report normalizes into. */
 interface Buckets {
@@ -215,5 +216,60 @@ maybe('replay: cost of the real session matches hand arithmetic per group', () =
       + Math.round(rates.cacheWrite * buckets.cacheWriteTokens / 1e6)
       + Math.round(rates.output * buckets.outputTokens / 1e6);
     assert.ok(Number.isSafeInteger(expected) && expected >= 0, `group ${key} prices to ${expected} nanodollars`);
+  }
+});
+
+maybe('replay: the strip renders the real session cost, and a free session reads $0.00', (t: any) => {
+  // The acceptance signal for the free-model requirement, on real data rather than a
+  // fixture: the money the host computes from the log must be the money the shipped
+  // bundle renders. A free card must read `$0.00`; it must never read `unpriced`, which
+  // is what a *missing* card says.
+  const events = readEvents(LOG as string);
+  const settings = resolveSettings({});
+  const billing = new Map<string, any>(settings.providers.map((provider: { id: string; billing: any }) => [provider.id, provider.billing]));
+  const fold = createLedgerApply({
+    tierFor: (providerId: string, at: number) => {
+      const calendar = billing.get(providerId);
+      return calendar === undefined ? 'flat' : tierAt(new Date(at), calendar);
+    },
+    hasCard: (providerId: string, modelId: string) => findCard(settings.providers, providerId, modelId).model !== null,
+  });
+
+  let state = initLedgerState() as LedgerState;
+  for (const event of events) state = fold(state, event);
+
+  let total = 0;
+  let unpriced = 0;
+  for (const [key, buckets] of Object.entries(state.totals)) {
+    const [providerId, modelId, tier] = key.split('\u0000');
+    const card = findCard(settings.providers, providerId, modelId);
+    const rates = card.model === null ? null : ratesAt(card.model, tier);
+    if (rates === null) {
+      unpriced += 1;
+      continue;
+    }
+    total += priceBuckets(rates, buckets)!.totalNano;
+  }
+  if (unpriced > 0) {
+    t.skip(`${unpriced} group(s) in this log have no rate card, so a rendered cost is not defined`);
+    return;
+  }
+
+  const cents = Math.round(Math.abs(total) / 1e7);
+  const shown = cents === 0 && total > 0 ? '< $0.01' : '$' + (cents / 100).toFixed(2);
+  const loaded = loadBundle();
+  const view = mount(loaded, loaded.slot('conversation.input.dock'), {
+    sessionId: 'replay',
+    useProjection: (name: string) => (
+      name === 'sessionMetrics' ? { version: 1, settings, ledger: toLedgerView(state) } : undefined
+    ),
+  });
+  try {
+    const text = view.text();
+    assert.ok(text.includes('Cost' + shown), `the strip must render the host's own total ${shown}: ${text}`);
+    assert.equal(text.includes('unpriced'), false, 'a priced session is never reported as unpriced');
+    if (total === 0) assert.match(text, /Cost\$0\.00/, `a zero-cost session reads $0.00: ${text}`);
+  } finally {
+    view.unmount();
   }
 });

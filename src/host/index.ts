@@ -19,7 +19,7 @@
 
 import { Config, resolveSettings } from './settings.js';
 import { createLedgerApply, initLedgerState, toLedgerView } from './ledger.js';
-import { tierAt } from './pricing.js';
+import { findCard, tierAt } from './pricing.js';
 import { sessionMetricsWireSchema } from './schema.js';
 
 export { Config } from './settings.js';
@@ -67,7 +67,11 @@ profile's \`cordis.patch.yml\`. Each model needs either a \`flat\` rate row or a
 \`billing.windows\` is priced flat and shows no peak chip.
 
 A model or provider with no rate card reports \`unpriced\`: tokens are still
-shown, but no cost is invented.
+shown, but no cost is invented. The ledger also keeps \`discovered\`: the
+provider/model pairs a session actually used with no card, deduped and bounded,
+which the panel lists under **Seen, unpriced** so a new integration is never
+silently invisible. A model the provider designates free ships a zero-rate card,
+so it prices to exactly \`$0.00\` rather than \`unpriced\`.
 `;
 
 /**
@@ -84,7 +88,12 @@ export function apply(ctx: any, rawConfig: any) {
     return billing === undefined ? 'flat' : tierAt(new Date(dateMs), billing);
   };
 
-  const fold = createLedgerApply({ tierFor });
+  const fold = createLedgerApply({
+    tierFor,
+    // The fold stays pure: pricing knowledge is injected as a predicate over the
+    // resolved settings, so the ledger itself never reads configuration.
+    hasCard: (providerId: any, modelId: any) => findCard(settings.providers, providerId, modelId).model !== null,
+  });
 
   ctx.sessionProjections.register({
     key: 'sessionMetrics',

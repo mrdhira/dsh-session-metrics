@@ -62,6 +62,9 @@ const PAIRS: Pair[] = [
   { provider: 'netra-runtime', model: 'deepseek/deepseek-v4.1-flash' },
   // an alias resolves to the same card, so both sides must price it identically
   { provider: 'deepseek-account', model: 'deepseek-v4.1-flash' },
+  // the integrated free model: both sides must agree it costs exactly zero, and the strip
+  // must render `$0.00` rather than `unpriced`
+  { provider: 'openrouter', model: 'nvidia/nemotron-3.5-lightning:free' },
 ];
 
 /** Mount the strip for one pair+mix and return its rendered money and tier. */

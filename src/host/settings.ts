@@ -105,9 +105,27 @@ const budget = z.object({
 });
 
 /**
+ * Zero rates for a model the provider itself designates **free**.
+ *
+ * A free model must price to exactly `$0.00`, which needs a card rather than no
+ * card: `priceBuckets(null, …)` is "unpriced" and would render `unpriced`, while
+ * an all-zero card is a real cost of zero. The strings are the same USD form as
+ * every other rate, so they pass the same schema and parse to 0 nanodollars.
+ * @returns a fresh all-zero rate row.
+ */
+const freeRates = () => ({ flat: { cacheHit: '0', cacheMiss: '0', output: '0' } });
+
+/**
  * Shipped rate cards. Netra uses its **live** catalog rates, which its own
  * billing ledger reproduced to the cent; the published docs table is roughly
  * 4.47x higher and is deliberately not used.
+ *
+ * OpenRouter ships only the models its own catalog marks free — the `:free`
+ * suffix and the "(free)" display name in `cordis.patch.yml` — at zero rates.
+ * Its paid models deliberately carry **no** card: the profile lists ids and
+ * context windows but no prices, and a guessed paid rate would be a fabricated
+ * bill. An unpriced pair is reported as `unpriced` and recorded in the ledger's
+ * `discovered` list instead (see `docs/pricing.md`).
  */
 export const SHIPPED_PROVIDERS = [
   {
@@ -154,6 +172,38 @@ export const SHIPPED_PROVIDERS = [
     models: [
       { model: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash (Netra)', rates: { flat: { cacheHit: '0.01', cacheMiss: '0.1', output: '0.25' } } },
       { model: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash 0731 (Netra)', rates: { flat: { cacheHit: '0.01', cacheMiss: '0.1', output: '0.25' } } },
+    ],
+    billing: { timezone: 'UTC', windows: [] },
+  },
+  {
+    id: 'openrouter',
+    label: 'OpenRouter',
+    models: [
+      // The model this profile actually runs (`agent-default-model` in cordis.patch.yml).
+      { model: 'nvidia/nemotron-3.5-lightning:free', label: 'NVIDIA: Nemotron 3.5 Lightning (free)', contextWindow: 1000000, rates: freeRates() },
+      // The rest of the catalog's free variants, transcribed from the profile patch.
+      { model: 'cohere/north-mini-code:free', label: 'Cohere: North Mini Code (free)', contextWindow: 256000, rates: freeRates() },
+      { model: 'dots-studio/dots-3-note-preview:free', label: 'Dots Studio: Dots3-Note Preview (free)', contextWindow: 512000, rates: freeRates() },
+      { model: 'google/gemma-4-26b-a4b-it:free', label: 'Google: Gemma 4 26B A4B  (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'google/gemma-4-31b-it:free', label: 'Google: Gemma 4 31B (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'inclusionai/ling-3.0-flash-fin:free', label: 'inclusionAI: Ling 3.0 Flash Fin (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'inclusionai/ling-3.0-flash-sante:free', label: 'inclusionAI: Ling 3.0 Flash Sante (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'inclusionai/ling-3.0-flash-vl:free', label: 'inclusionAI: Ling 3.0 Flash VL (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'liquid/lfm-2.5-2.6b:free', label: 'LiquidAI: LFM2.5-2.6B (free)', contextWindow: 65536, rates: freeRates() },
+      { model: 'nex-agi/nex-n2.5-mini:free', label: 'Nex AGI: Nex-N2.5-Mini (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'nex-agi/nex-n2.5-pro:free', label: 'Nex AGI: Nex-N2.5-Pro (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'NVIDIA: Nemotron 3 Nano Omni (free)', contextWindow: 256000, rates: freeRates() },
+      { model: 'nvidia/nemotron-3-super-120b-a12b:free', label: 'NVIDIA: Nemotron 3 Super (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'nvidia/nemotron-3-ultra-550b-a55b:free', label: 'NVIDIA: Nemotron 3 Ultra (free)', contextWindow: 1000000, rates: freeRates() },
+      { model: 'poolside/laguna-s-2.1:free', label: 'Poolside: Laguna S 2.1 (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'poolside/laguna-xs-2.1:free', label: 'Poolside: Laguna XS 2.1 (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'qwen/qwen3.8-27b:free', label: 'Qwen: Qwen3.8 27B (free)', contextWindow: 262144, rates: freeRates() },
+      { model: 'thinkingmachines/inkling-small:free', label: 'Thinking Machines: Inkling Small (free)', contextWindow: 1048576, rates: freeRates() },
+      { model: 'thinkingmachines/inkling:free', label: 'Thinking Machines: Inkling (free)', contextWindow: 1048576, rates: freeRates() },
+      // The provider's own free-model router. The catalog id is `openrouter/free`, but the
+      // request header strips the provider prefix (`openrouter/auto` was observed on the
+      // wire as `auto`), so both spellings resolve.
+      { model: 'free', aliases: ['openrouter/free'], label: 'Free Models Router', contextWindow: 200000, rates: freeRates() },
     ],
     billing: { timezone: 'UTC', windows: [] },
   },

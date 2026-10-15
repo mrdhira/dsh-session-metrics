@@ -17,6 +17,14 @@
  *   - `rows` is bounded for the wire, while `totals` is not, so a long session
  *     never loses money to a display limit.
  *
+ * It also keeps a second, smaller list: `discovered`, the provider/model pairs
+ * this session actually used that have **no rate card**. A pair with no card is
+ * priced as `unpriced`, and without this list that fact is invisible on every
+ * screen that shows only configuration — the Pricing page cannot see sessions,
+ * and a session-scoped detail view cannot see other sessions. Recording it here
+ * is what lets the client say "this is what was seen, and it is unpriced"
+ * instead of silently omitting it; it is deduped by pair and bounded.
+ *
  * State is plain JSON: no BigInt, no Date, no functions. A projection unit's
  * state is checkpointed, and the checkpoint row schema refuses anything
  * `JSON.stringify` cannot carry.
@@ -29,6 +37,9 @@ const UNKNOWN_TIER = 'flat';
 
 /** Per-step rows kept for the ledger view. */
 const ROW_LIMIT = 200;
+
+/** Distinct unpriced provider/model pairs kept. */
+const DISCOVERY_LIMIT = 32;
 
 /**
  * Key one accumulated bucket group.
@@ -72,7 +83,53 @@ export function bucketsFrom(usage: any) {
  * @returns empty state.
  */
 export function initLedgerState() {
-  return { turns: 0, steps: 0, totals: {}, rows: [], openIndex: null, lastProvider: null, lastModel: null };
+  return { turns: 0, steps: 0, totals: {}, rows: [], openIndex: null, lastProvider: null, lastModel: null, discovered: {} };
+}
+
+/**
+ * Key one observed-but-unpriced pair.
+ * @param provider - provider id, or null.
+ * @param model - model id, or null.
+ * @returns a stable key string.
+ */
+function pairKey(provider: any, model: any) {
+  return `${provider ?? ''}\u0000${model ?? ''}`;
+}
+
+/**
+ * Record one billable observation of a pair with no rate card, deduped by pair.
+ *
+ * Tokens are summed as evidence of how much went unpriced; no money is derived
+ * here, because a pair with no card has no rate to apply. The list is bounded —
+ * a session that cycles through more unpriced pairs than the limit keeps the
+ * first ones seen, so the earliest evidence is what survives.
+ * @param state - ledger state (not mutated).
+ * @param provider - provider id from the request header.
+ * @param model - model id from the request header.
+ * @param at - the instant of the report.
+ * @param buckets - the buckets that were attributed to the pair.
+ * @returns the new state.
+ */
+function noteDiscovered(state: any, provider: any, model: any, at: any, buckets: any) {
+  const discovered = state.discovered ?? {};
+  const key = pairKey(provider, model);
+  const current = discovered[key];
+  if (current === undefined && Object.keys(discovered).length >= DISCOVERY_LIMIT) return state;
+  const entry = current ?? { provider: provider ?? null, model: model ?? null, tokens: 0, steps: 0, firstSeen: at ?? null, lastSeen: at ?? null };
+  return {
+    ...state,
+    discovered: {
+      ...discovered,
+      [key]: {
+        provider: entry.provider,
+        model: entry.model,
+        tokens: entry.tokens + bucketTotal(buckets),
+        steps: entry.steps + 1,
+        firstSeen: entry.firstSeen,
+        lastSeen: at ?? null,
+      },
+    },
+  };
 }
 
 /**
@@ -125,11 +182,15 @@ function subtractFromTotals(totals: any, key: any, buckets: any) {
  * @param options - `tierFor(providerId, dateMs)` resolves the billing tier; it is
  *   the only settings-dependent input, so a calendar edit changes state only
  *   through a re-fold (which a plugin reload performs, since disposing the
- *   registration drops its cells).
+ *   registration drops its cells). `hasCard(providerId, modelId)` answers
+ *   whether the resolved settings carry a rate card for the pair; when it is
+ *   absent the fold assumes every pair is configured, so the ledger stays pure
+ *   and existing callers keep their behaviour.
  * @returns the projection `apply` function.
  */
 export function createLedgerApply(options: any) {
   const tierFor = options.tierFor ?? (() => UNKNOWN_TIER);
+  const hasCard = options.hasCard ?? (() => true);
 
   const patchRow = (state: any, patch: any) => {
     if (state.openIndex === null) return state;
@@ -227,7 +288,12 @@ export function createLedgerApply(options: any) {
         rows[openIndex] = { ...row, endTime: at, provider, model, tier: tierAtReport, buckets, groupKey: key };
       }
       totals = addToTotals(totals, key, buckets);
-      return { ...state, rows, totals, openIndex };
+      const next = { ...state, rows, totals, openIndex };
+      // Discovery is recorded where usage is attributed, not at `step/start`: a
+      // header alone is a request that may never have been billed, while a
+      // reported bucket set is money that was really spent (and, with no card,
+      // really cannot be priced).
+      return hasCard(provider, model) ? next : noteDiscovered(next, provider, model, at, buckets);
     }
 
     if (type === 'step/end' || type === 'turn/end') {
@@ -241,6 +307,29 @@ export function createLedgerApply(options: any) {
 
 /** Memoized views, so a re-render does not rebuild the row objects. */
 const views = new WeakMap();
+
+/**
+ * The observed-but-unpriced pairs, as an array ordered by tokens spent.
+ *
+ * Ordered rather than insertion-ordered so the biggest unpriced spend is the one
+ * a reader sees first; ties break on the pair so the order is deterministic. A
+ * state checkpointed before this field existed has none, so it is optional here.
+ * @param state - the ledger state.
+ * @returns the discovery rows.
+ */
+function discoveredView(state: any) {
+  const entries = Object.values(state.discovered ?? {}) as any[];
+  return entries
+    .map((entry) => ({
+      provider: entry.provider ?? null,
+      model: entry.model ?? null,
+      tokens: entry.tokens,
+      steps: entry.steps,
+      firstSeen: entry.firstSeen ?? null,
+      lastSeen: entry.lastSeen ?? null,
+    }))
+    .sort((a, b) => b.tokens - a.tokens || pairKey(a.provider, a.model).localeCompare(pairKey(b.provider, b.model)));
+}
 
 /**
  * Project the ledger into the client-visible value.
@@ -267,6 +356,7 @@ export function toLedgerView(state: any) {
       tier: row.tier,
       buckets: row.buckets,
     })),
+    discovered: discoveredView(state),
   };
   views.set(state, view);
   return view;

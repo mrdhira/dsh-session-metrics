@@ -16,10 +16,25 @@ A strip below the composer, in the same seat as the shipped status pills:
 | provider | shown when it is not your configured primary provider |
 | `budget` | progress against an optional per-session ceiling |
 
+A provider whose models are free renders `$0.00` (a real zero, from a zero-rate
+card), not `unpriced`. `unpriced` means *no card*, and an unpriced pair is never
+rendered as a number.
+
 Clicking it opens the detail: cost breakdown (cache-hit / miss / write / output),
 cache savings and blended rate, the rate window with a countdown to the next
 change, cost per step, cost per model when a session switched models, and the
 projections each figure came from.
+
+## New providers and models are discovered, never silent
+
+Integrate a provider and use it before its rates are configured, and the session's
+own detail says so: a **Seen, unpriced** section lists every provider/model pair
+the ledger actually observed with no rate card, with the tokens it used, and the
+model table marks the row `unpriced`. Nothing is invented, and nothing is hidden —
+the pair is named so a rate card can be added where rates are edited.
+
+A free model needs a card of zeros, not the absence of one: the absence is what
+prints `unpriced`. `docs/pricing.md` carries the details and the shipped cards.
 
 ## What it deliberately does not show
 
@@ -48,9 +63,12 @@ host file has no effect until restart — see `docs/data-sources.md`.)
 
 ## Configure
 
-Rates ship for `deepseek-account`, `deepseek-official` and `netra-runtime`, so
-nothing needs configuring to start. To change a rate, either open the plugin's
-page in the **Plugins** sidebar, or edit your profile's `cordis.patch.yml`:
+Rates ship for `deepseek-account`, `deepseek-official`, `netra-runtime` and
+`openrouter`, so nothing needs configuring to start. OpenRouter ships **only the
+models its own catalog marks free** (the `:free` suffix, and the free-models
+router) at zero rates; its paid models deliberately have no card, because the
+profile lists no prices for them. To change a rate, either open the plugin's page
+in the **Plugins** sidebar, or edit your profile's `cordis.patch.yml`:
 
 ```yaml
 - id: session-metrics
@@ -66,13 +84,18 @@ page in the **Plugins** sidebar, or edit your profile's `cordis.patch.yml`:
         billing: { windows: [] }      # no peak concept
 ```
 
-`docs/pricing.md` documents the full rate-card format, the shipped cards, and the
-evidence behind Netra's rates.
+A `providers:` list in your patch **replaces** the shipped cards rather than
+adding to them, so a profile that pins its own providers stops shipping the
+OpenRouter free cards with them. Add a card for the pair — or leave it out and
+let the **Seen, unpriced** section name it (see above).
+
+`docs/pricing.md` documents the full rate-card format, the shipped cards, the
+free-model rule and the evidence behind Netra's rates.
 
 ## Develop
 
 ```bash
-node --test "test/*.test.ts"                       # 81 tests
+node --test "test/*.test.ts"                       # 103 tests
 DSH_SESSION_LOG=<path>.jsonl.zstd node --test test/replay.test.js
 ```
 
