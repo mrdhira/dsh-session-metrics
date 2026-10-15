@@ -105,7 +105,12 @@ test('page: lists every integrated provider with its models', () => {
     }
     assert.ok(text.includes('deepseek-flash'), 'expected the model rows');
     assert.ok(text.includes('deepseek/deepseek-v4.1-flash'), 'expected netra models too');
-    assert.equal(entryIdSeen[0], 'include:session-metrics', 'the page reads the Host entry id');
+    // The id `configForms` is keyed by is the settings NAMESPACE (the id the bundle's patch
+    // declares), not the Loader's entry id. Asserting the wrong one is the bug this pins: the
+    // entry id returns a controller whose value layer is unavailable, so the page would look
+    // read-only or empty with no error anywhere.
+    assert.equal(entryIdSeen[0], 'session-metrics', 'the page reads the settings namespace');
+    assert.notEqual(entryIdSeen[0], 'include:session-metrics', 'never the Loader entry id');
   } finally {
     view.unmount();
   }

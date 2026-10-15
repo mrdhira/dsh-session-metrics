@@ -26,7 +26,7 @@ const ReactDOM = (function () {
   }
 })();
 const h = React.createElement;
-const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } = React;
 
 const PLUGIN_ID = 'dsh-session-metrics';
 /** Rendered in the detail footer so a shipped generation is verifiable from a screenshot. */
@@ -100,6 +100,7 @@ const STYLES = [
   '.dsm-rate{display:flex;flex-direction:column;gap:1px;font-size:0.91em;color:var(--dsw-alias-label-quaternary)}',
   '.dsm-usdLabel{font-size:0.91em;color:var(--dsw-alias-label-quaternary)}',
   '.dsm-tag{font-size:0.91em;color:var(--dsw-alias-label-quaternary);font-weight:400}',
+  '.dsm-badge{display:inline-flex;align-items:center;gap:4px;font-size:0.91em;line-height:16px;white-space:nowrap;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:0 8px;color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-fill-tsp-secondary)}',
   '.dsm-primary{border-color:var(--dsw-alias-border-l3);font-weight:600;color:var(--dsw-alias-label-primary)}',
   '.dsm-toggle:disabled{opacity:.45;cursor:default}',
   '.dsm-diag{border-style:dashed;opacity:.85}',
@@ -293,6 +294,192 @@ function nextBoundary(ms, billing) {
     if (candidate > ms && tierAt(candidate, billing) !== current) return candidate;
   }
   return boundary;
+}
+
+// ------------------------------------------------ plugin detail badge (T-001)
+/**
+ * What the detail badge shows, once a real value is behind it.
+ *
+ * `tier` is null when no configured provider has a peak window: a flat provider
+ * has no off-peak rate, and naming "flat" beside a peak/off-peak chip would
+ * claim a state that provider never enters. `zone` names the calendar the tier
+ * was read in.
+ */
+interface BadgePayload {
+  providers: number;
+  models: number;
+  tier: string | null;
+  zone: string | null;
+  title: string;
+}
+
+/**
+ * The accepted configuration layer out of whatever snapshot shape the service serves.
+ *
+ * `readSnapshot` accepts either the owner's `{ state, mutate }` form or a settings
+ * controller. Only the `value` layer counts: `base` is what an override would inherit,
+ * and a badge built from shipped defaults would claim configuration that is not there.
+ */
+function badgeValue(form: any) {
+  const snap = readSnapshot(form);
+  if (snap === null || snap === undefined) return null;
+  // Read the own property only: the prototype must not answer for the accepted layer.
+  return snap.value === undefined ? null : snap.value;
+}
+
+/**
+ * One provider's billing calendar, with every field `tierAt` reads.
+ *
+ * `weekdays` and `holidays` are guards inside `tierAt`, so a calendar copied
+ * without them reports off-peak for every instant of a peak window — which is
+ * what a half-copied calendar did before this carried them.
+ * @param provider - a provider from the resolved configuration.
+ * @returns the calendar, or null when the provider carries none.
+ */
+function billingOf(provider: any) {
+  const billing = provider && typeof provider === 'object' ? provider.billing : null;
+  if (billing === null || typeof billing !== 'object') return null;
+  return {
+    windows: Array.isArray(billing.windows) ? billing.windows : [],
+    // The schema lists the weekdays CHARGED AT PEAK, and `tierAt` reads an instant
+    // outside that list as off-peak — so an empty list is "no peak day", not "every
+    // day". Carried through exactly as it arrives.
+    weekdays: Array.isArray(billing.weekdays) ? billing.weekdays : [],
+    holidays: Array.isArray(billing.holidays) ? billing.holidays : [],
+    timezone: typeof billing.timezone === 'string' && billing.timezone !== '' ? billing.timezone : 'UTC',
+  };
+}
+
+/**
+ * The badge's content, or null when there is no honest value to show.
+ *
+ * The whole point of this component is not to exist when it cannot say
+ * something true: an empty chip is the failure mode T-001 exists to avoid, so
+ * every branch that lacks a real provider list, or a real price state, returns
+ * null and the slot renders nothing at all.
+ * @param value - the accepted configuration layer.
+ * @param nowMs - the instant to read the calendar at.
+ * @returns the payload, or null when the badge must stay away.
+ */
+function badgePayload(value: any, nowMs: number): BadgePayload | null {
+  const providers = value && Array.isArray(value.providers) ? value.providers : [];
+  if (providers.length === 0) return null;
+  let models = 0;
+  let calendar = null;
+  let zone = 'UTC';
+  let windowed = false;
+  providers.forEach(function (provider) {
+    if (Array.isArray(provider && provider.models)) models += provider.models.length;
+    const billing = billingOf(provider);
+    if (billing === null || billing.windows.length === 0) return;
+    windowed = true;
+    // The first provider with a peak window supplies the calendar: that is the state
+    // the chip names, and the title says which zone it was read in.
+    if (calendar === null) {
+      calendar = billing;
+      zone = billing.timezone;
+    }
+  });
+  const tier = calendar === null ? null : tierAt(nowMs, calendar);
+  const title = (windowed
+    ? 'The peak/off-peak state right now, in ' + zone + ', for ' + providers.length +
+      ' configured provider(s) with ' + models + ' model(s). Read from this plugin\u2019s own configuration.'
+    : 'No configured provider has peak windows, so every hour is charged at one rate. ' +
+      providers.length + ' provider(s) and ' + models + ' model(s) are configured.')
+    + ' Set rates on the component row under dsh-session-metrics \u203a session-metrics.';
+  return { providers: providers.length, models: models, tier: tier, zone: zone, title: title };
+}
+
+/**
+ * The one child that decides between a real chip and nothing.
+ *
+ * It takes its `title` from props on purpose: the DOM suite mounts a component
+ * with props alone, and a parent that held it in state would also re-render on
+ * every revision of the configuration.
+ */
+class BadgeView extends React.PureComponent<any, any> {
+  render() {
+    const payload = badgePayload(this.props.value, Date.now());
+    if (payload === null) return null;
+    const segments = [
+      payload.providers + (payload.providers === 1 ? ' provider' : ' providers'),
+      payload.models + (payload.models === 1 ? ' model' : ' models'),
+    ];
+    if (payload.tier !== null) segments.push(payload.tier);
+    const children: any[] = [];
+    segments.forEach(function (part, index) {
+      if (index > 0) children.push('\u00b7');
+      if (part === 'peak' || part === 'off-peak') {
+        children.push(h('span', { key: 'tier', className: part === 'peak' ? 'dsm-peak' : 'dsm-off' }, part));
+      } else {
+        children.push(part);
+      }
+    });
+    return h('span', { className: 'dsm-badge', title: payload.title }, children);
+  }
+}
+
+/**
+ * The Plugins-page badge beside the plugin title (T-001).
+ *
+ * The slot hands this component `{ subject }` and standard hooks only — no
+ * `getService` — so a badge cannot reach the configuration through props. It is
+ * handed a getter captured in the registration closure instead, and the getter
+ * is called on **every render** rather than once at registration: the settings
+ * service may arrive after this bundle. A service that is missing, null,
+ * unreadable or without an entry for this plugin is not an error — it means the
+ * badge has nothing true to say, so it renders nothing.
+ *
+ * Every step is defensive because this component runs *inside* the slot owner's
+ * render: a throw here would abdicate the entry, not merely hide the chip.
+ * @param props - slot props plus the `getService` getter `apply` supplies.
+ * @returns the badge, or null when there is no real value to show.
+ */
+function PluginBadge(props) {
+  const propsGet = props && typeof props.getService === 'function' ? props.getService : null;
+  const getService = propsGet === null ? props.serviceGet : propsGet;
+  const stableGet = useCallback(function (name) {
+    return getService && typeof getService === 'function' ? getService(name) : undefined;
+  }, [getService]);
+  const service = useMemo(function () {
+    if (typeof getService !== 'function') return null;
+    const found = stableGet('configForms');
+    return found === undefined || found === null ? null : found;
+  }, [stableGet, getService]);
+  // `ctx.get('configForms')` returns the service itself; `service.get(entry)` returns
+  // this plugin's form. Both are checked at every level: `undefined` and `null` are
+  // both normal on a restricted context, and a deployment without a settings service
+  // simply renders no badge.
+  const form = useMemo(function () {
+    if (service === null || typeof service.get !== 'function') return null;
+    try {
+      const found = service.get(SETTINGS_NS);
+      return found === undefined || found === null ? null : found;
+    } catch (error) {
+      return null;
+    }
+  }, [service]);
+  const subscribe = useCallback(function (listener) {
+    if (form === null || typeof form.subscribe !== 'function') return function () {};
+    try {
+      const unsubscribe = form.subscribe(listener);
+      return function () {
+        if (typeof unsubscribe === 'function') unsubscribe();
+      };
+    } catch (error) {
+      return function () {};
+    }
+  }, [form]);
+  const getSnapshot = useCallback(function () {
+    if (form === null) return null;
+    try {
+      return badgeValue(form);
+    } catch (error) {
+      return null;
+    }
+  }, [form]);
+  const value = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return value === null ? null : h(BadgeView, { value: value });
 }
 
 /** `hh:mm` for an instant in a zone. */
@@ -962,8 +1149,18 @@ const openState = useState(false);
 
 
 // ------------------------------------------------- pricing page (Plugins)
-/** The Host entry id whose configuration this page edits. */
+/** The Loader's entry id for this plugin's row — what the Host's Config inspector takes. */
 const CONFIG_ENTRY = 'include:session-metrics';
+
+/**
+ * The settings *namespace* the row serves — the id the bundle's patch declares.
+ *
+ * `configForms` is keyed by **namespace**, not by the Loader entry id: asking it for
+ * `include:session-metrics` returns a controller whose value layer is unavailable, which is
+ * indistinguishable from "nothing is configured". The plugin-manager's own row page gates on
+ * `view.ns === openRow.rowId`, and the row is `session-metrics`.
+ */
+const SETTINGS_NS = 'session-metrics';
 
 /** The `plugins.row.config` key: `<bundle>#<rowId>`, as the ledger expects. */
 const ROW_CONFIG_KEY = 'dsh-session-metrics#session-metrics';
@@ -1157,7 +1354,7 @@ function PricingPage(props) {
   const service = props.getService ? props.getService('configForms') : props.configForms;
   const form = supplied !== null
     ? supplied
-    : (service && typeof service.get === 'function' ? service.get(CONFIG_ENTRY) : null);
+    : (service && typeof service.get === 'function' ? service.get(SETTINGS_NS) : null);
   const snapState = useState(null);
   const snapshot = snapState[0];
   const setSnapshot = snapState[1];
@@ -1251,7 +1448,7 @@ function PricingPage(props) {
           served = 'unreadable';
         }
       }
-      return 'entry ' + CONFIG_ENTRY + ' \u00b7 form ' + (form === null ? 'not supplied' : 'supplied') +
+      return 'entry ' + CONFIG_ENTRY + ' \u00b7 namespace ' + SETTINGS_NS + ' \u00b7 form ' + (form === null ? 'not supplied' : 'supplied') +
         ' \u00b7 accepted (value) ' + (accepted === null ? 'absent' : 'present') +
         ' \u00b7 inherited (base) ' + (inherited === null ? 'absent' : 'present') +
         ' \u00b7 served namespaces: ' + served;
@@ -1478,6 +1675,32 @@ function PricingPage(props) {
     h('pre', { className: 'dsm-pre' }, toYaml(providers)));
 }
 
+/**
+ * Register the detail badge beside the plugin title (T-001).
+ *
+ * One helper so the same contribution can be attached through either door: the
+ * optional `configForms` injection when the context offers one, or the root
+ * context otherwise. The registration carries ONLY the options this slot
+ * declares — `id`, `order`, `label`; an `inject` option on the slot registration
+ * would replace the owner's own props (`subject` and the standard hooks) and
+ * leave the component with nothing to read.
+ * @param slots - the `slots` service that owns the registration.
+ * @param serviceGet - name → service, the badge's read of this plugin's configuration.
+ * @returns the deferred registration the slot service returns.
+ */
+function registerBadge(slots: any, serviceGet: (name: string) => any) {
+  return slots.inject('plugins.detail.badge', function () {
+    return slots.register({
+      name: 'plugins.detail.badge',
+      id: PLUGIN_ID,
+      order: 20,
+      label: 'Session metrics: providers, models and the current peak state',
+    }, function (props: any) {
+      return h(MetricsBoundary, null, h(PluginBadge, Object.assign({}, props, { serviceGet: serviceGet })));
+    });
+  });
+}
+
 const inject = ['slots'];
 
 /**
@@ -1519,6 +1742,53 @@ function apply(ctx) {
       return h(MetricsBoundary, null, h(PricingPage, Object.assign({}, props, { getService: getService, surface: 'row' })));
     });
   });
+
+  // The badge beside the plugin title on the Plugins page (T-001). The slot's owner
+  // props are `{ subject }` and standard hooks — no `getService`, no configuration —
+  // so the service getter is captured in the closure and passed as a prop, and it
+  // resolves at render time so a settings service that arrives later is still picked up.
+  //
+  // `configForms` is an *optional* service: a deployment without the settings UI
+  // provides none. `ctx.inject(['configForms'], …)` is the documented idiom for that —
+  // the callback runs only while the service is provided, so such a deployment shows no
+  // badge at all — and inside the callback `child.configForms` is a legal property read,
+  // because the injection is what declares it. On the root context a service is only
+  // readable as a property when it is declared, which is exactly why the badge is
+  // attached through this door instead.
+  const canInject = (function () {
+    // Read through try/catch: on a restricted client context an undeclared property
+    // read THROWS (`cannot get property "…" without inject`), and the DOM harness
+    // reproduces that. A throw here means "no optional injection on this context",
+    // not a broken badge.
+    try {
+      return typeof ctx.inject === 'function';
+    } catch (error) {
+      return false;
+    }
+  })();
+
+  if (canInject) {
+    ctx.inject(['configForms'], function (child) {
+      // Prefer the injected declaration; keep `ctx.get('configForms')` as the
+      // secondary source, because a service can be replaced while the badge is
+      // mounted and both reads are honest when guarded.
+      registerBadge(child.slots, function (name) {
+        if (name === 'configForms') {
+          try {
+            const injected = child.configForms;
+            if (injected !== undefined && injected !== null) return injected;
+          } catch (error) {
+            /* the service went away since activation: fall through to the root lookup */
+          }
+        }
+        return getService(name);
+      });
+    });
+  } else {
+    // No optional injection on this context: register through the root context, the
+    // path the DOM harness and any deployment without the API take.
+    registerBadge(ctx.slots, getService);
+  }
 
   // The registration carries ONLY the options this slot declares — `id`, `order`,
   // `label`. Passing an `inject` here is not supported for `conversation.input.dock`,
