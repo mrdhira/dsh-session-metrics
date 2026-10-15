@@ -72,7 +72,7 @@ evidence behind Netra's rates.
 ## Develop
 
 ```bash
-node --test "test/*.test.js"                       # 62 tests
+node --test "test/*.test.ts"                       # 81 tests
 DSH_SESSION_LOG=<path>.jsonl.zstd node --test test/replay.test.js
 ```
 
@@ -92,8 +92,12 @@ types/dsh.d.ts       the DSH surfaces this plugin uses (the app ships no .d.ts)
 build.mjs            esbuild: ESM host half, CJS browser half + loader handshake
 ```
 
-`lib/**` is generated — never edit it. `npm run build` then `npm test` (`pretest` builds
-for you); `npm run typecheck` gates both halves.
+`lib/**` is generated — never edit it. `npm run build` then `npm test` (`pretest` builds for you);
+`npm run typecheck` gates three projects (host, browser half, tests).
+
+**On a fresh clone, build before anything else.** The tests import `lib/**` and the test project's
+typecheck resolves its types from those built bytes, so `lib/` must exist first — it is generated and
+therefore not in the repository.
 
 The strip shows, in order: peak state (`▲ ON PEAK HOURS` / `▼ OFF PEAK HOURS`), local time,
 cost, cache savings and the provider. The detail panel shows a cost breakdown, a saving

@@ -187,7 +187,7 @@ normally.
 
 This is not academic. While the host half was bundled, `lib/v1/*.js` still held
 hand-written pre-port files; five test files imported those, and the suite validated code
-that was no longer in the shipped bundle — green, and wrong. `test/build.test.js` now fails
+that was no longer in the shipped bundle — green, and wrong. `test/build.test.ts` now fails
 when a source is newer than its artifact, and when a shipped file imports something the
 package does not publish.
 
@@ -200,14 +200,14 @@ Two consequences worth remembering:
 
 ## What the suite does and does not cover
 
-- `test/build.test.js` — artifacts mirror sources, are fresh, and resolve inside the package.
+- `test/build.test.ts` — artifacts mirror sources, are fresh, and resolve inside the package.
 - `test/parity.test.js` — the browser half's embedded cost arithmetic against the host's,
   across a matrix of cards, tiers and token mixes, driven through the shipped bundle.
 - `test/pricing.test.js`, `settings.test.js`, `ledger.test.js` — the pure host logic.
 - `test/replay.test.js` — a real session log, comparing the ledger against the official
   `tokenUsage` fold. It uses a `maybe(...)` wrapper and **skips when `DSH_SESSION_LOG` is
   unset**; the runner reports those skips rather than passing them silently.
-- `test/client.dom.test.js`, `test/pricing-page.dom.test.js` — the two client surfaces under
+- `test/client.dom.test.ts`, `test/pricing-page.dom.test.js` — the two client surfaces under
   jsdom through a stub loader that mirrors the restricted context.
 
 Typing is deliberate and uneven: the host domain modules are `strict`, while the dynamic
