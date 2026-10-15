@@ -15,12 +15,66 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Config, resolveSettings, SHIPPED_PROVIDERS } from '../lib/v1/settings.js';
+import { Config as NativeConfig, resolveSettings, SHIPPED_PROVIDERS } from '../lib/v1/settings.js';
 
-const ids = (settings) => settings.providers.map((p) => p.id);
+/**
+ * A native Schemastery node, as the Host's own code and these cases walk it.
+ *
+ * The shim's inferred type only covers `parse`/`validate`; the brand, `meta`, `dict`,
+ * `inner` and `list` are the protocol this file exists to pin, so they are declared here.
+ */
+interface SchemaNode {
+  type: string;
+  meta: Record<string, any>;
+  dict: Record<string, SchemaNode>;
+  inner: SchemaNode;
+  list: SchemaNode[];
+  value?: any;
+  '~standard': { validate(value: unknown): { issues?: unknown } };
+}
+
+/** `Config` at runtime IS that node; the imported value is only typed as the shim. */
+const Config = NativeConfig as unknown as SchemaNode;
+
+/** A config object as the Host may hand it over: any part of it can be absent or wrong. */
+type ConfigInput = Record<string, any> | null | undefined;
+
+/** The resolved settings object, as the module returns it. */
+type ResolvedSettings = ReturnType<typeof resolveSettings>;
+
+/** What a resolution case pins; the fields it omits stay at the shipped default. */
+interface ResolutionWant {
+  providers: string[];
+  problems: number;
+  display?: Record<string, any>;
+  budget?: Record<string, any>;
+  flatModel?: boolean;
+}
+
+/** What a leniency case pins: the surviving providers and the recorded problem. */
+interface LeniencyWant {
+  providers: string[];
+  problem: RegExp;
+  currency?: string;
+  sessionUsd?: number;
+}
+
+interface ResolutionCase {
+  name: string;
+  input: ConfigInput;
+  want: ResolutionWant;
+}
+
+interface LeniencyCase {
+  name: string;
+  input: ConfigInput;
+  want: LeniencyWant;
+}
+
+const ids = (settings: ResolvedSettings) => settings.providers.map((p) => p.id);
 
 /** Inputs that must resolve cleanly. */
-const RESOLUTION_CASES = [
+const RESOLUTION_CASES: ResolutionCase[] = [
   {
     name: 'an absent config object resolves to the shipped defaults',
     input: undefined,
@@ -58,7 +112,7 @@ const RESOLUTION_CASES = [
 ];
 
 /** Negative inputs: each must degrade to a usable configuration and say why. */
-const LENIENCY_CASES = [
+const LENIENCY_CASES: LeniencyCase[] = [
   {
     name: 'one malformed provider is skipped and the rest resolve',
     input: {
@@ -101,10 +155,10 @@ test('defaults: every resolution case yields the expected providers and problems
     assert.equal(settings.problems.length, want.problems, `${name}: problems ${JSON.stringify(settings.problems)}`);
     // Only the fields the case names: the rest of the resolved object is the shipped default.
     for (const [key, value] of Object.entries(want.display ?? {})) {
-      assert.deepEqual(settings.display[key], value, `${name}: display.${key}`);
+      assert.deepEqual((settings.display as Record<string, any>)[key], value, `${name}: display.${key}`);
     }
     for (const [key, value] of Object.entries(want.budget ?? {})) {
-      assert.deepEqual(settings.budget[key], value, `${name}: budget.${key}`);
+      assert.deepEqual((settings.budget as Record<string, any>)[key], value, `${name}: budget.${key}`);
     }
     if (want.flatModel) assert.equal(settings.providers[0].models[0].mode, 'flat', `${name}: mode`);
   }
@@ -136,16 +190,17 @@ test('leniency: a bad field degrades to a usable configuration and names itself'
 
 test('the shipped table is never mutated by resolving it', () => {
   const first = resolveSettings({});
-  first.providers[0].models[0].aliases.push('mutated');
+  // The resolved card is a fresh copy; `aliases` is the field the shipped peak card carries.
+  (first.providers[0].models[0] as { aliases: string[] }).aliases.push('mutated');
   const second = resolveSettings({});
   assert.equal(second.providers[0].models[0].aliases.includes('mutated'), false, 'each call gets a fresh copy');
-  assert.equal(SHIPPED_PROVIDERS[0].models[0].aliases.includes('mutated'), false, 'and the module table is untouched');
+  assert.equal((SHIPPED_PROVIDERS[0].models[0] as { aliases: string[] }).aliases.includes('mutated'), false, 'and the module table is untouched');
 });
 
 // --- the Host's gate on serving a configuration namespace -------------------------------
 
 /** The Host's own predicate, copied from `@deepseek-ai/dsh-app-boot`. */
-function isNativeConfigSchema(value) {
+function isNativeConfigSchema(value: unknown): boolean {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
   const meta = Reflect.get(value, 'meta');
   return Reflect.get(value, Symbol.for('schemastery')) === true
@@ -154,7 +209,7 @@ function isNativeConfigSchema(value) {
 }
 
 /** The Host's volatility placement rule, copied from the same source. */
-function validateVolatilePlacement(node, path, blocked = false, seen = new Map()) {
+function validateVolatilePlacement(node: any, path: string, blocked = false, seen = new Map<any, Set<boolean>>()): void {
   const states = seen.get(node) ?? new Set();
   if (states.has(blocked)) return;
   states.add(blocked);
@@ -178,10 +233,10 @@ test('native: Config passes the Host brand check and accepts an absent config', 
 
 test('native: the whole graph walks under the projector rules', () => {
   const types = new Set(['any', 'never', 'const', 'boolean', 'string', 'number', 'object', 'array', 'dict', 'tuple', 'union', 'transform']);
-  const needsChild = { object: 'dict', array: 'inner', dict: 'inner', tuple: 'list', union: 'list', transform: 'inner' };
-  const problems = [];
+  const needsChild: Record<string, string | undefined> = { object: 'dict', array: 'inner', dict: 'inner', tuple: 'list', union: 'list', transform: 'inner' };
+  const problems: string[] = [];
   let visited = 0;
-  const visit = (node, path) => {
+  const visit = (node: any, path: string): void => {
     visited += 1;
     const type = Reflect.get(node, 'type');
     if (!types.has(type)) problems.push(`${path}: native type "${type}" is not projectable`);
@@ -191,7 +246,7 @@ test('native: the whole graph walks under the projector rules', () => {
     if (need !== undefined && Reflect.get(node, need) === undefined) problems.push(`${path}: ${type} is missing ${need}`);
     if (type === 'object') for (const [key, child] of Object.entries(node.dict)) visit(child, `${path}/${key}`);
     else if (type === 'array' || type === 'dict') visit(node.inner, `${path}[]`);
-    else if (type === 'tuple' || type === 'union') node.list.forEach((child, index) => visit(child, `${path}/${index}`));
+    else if (type === 'tuple' || type === 'union') node.list.forEach((child: any, index: number) => visit(child, `${path}/${index}`));
   };
   visit(Config, 'config');
   assert.deepEqual(problems, []);
@@ -214,7 +269,7 @@ test('native: chaining after construction is reflected in the projected meta', (
   assert.equal(Config.dict.providers.inner.dict.models.type, 'array');
   const currency = Config.dict.display.dict.currency;
   assert.equal(currency.type, 'union');
-  assert.deepEqual(currency.list.map((node) => node.value), ['USD', 'CNY']);
+  assert.deepEqual(currency.list.map((node: any) => node.value), ['USD', 'CNY']);
   assert.equal(Config.dict.budget.dict.sessionUsd.meta.required, false, 'an optional field projects as not required');
 });
 

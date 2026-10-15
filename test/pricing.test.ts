@@ -19,13 +19,42 @@ import {
   bucketTotal, formatInZone, countdown, FLAT, PEAK, OFF_PEAK,
 } from '../lib/v1/pricing.js';
 
+/** A provider calendar as the shipped settings table writes it. */
+interface Billing {
+  timezone?: string;
+  weekdays?: number[];
+  windows: ReadonlyArray<readonly number[]>;
+  holidays?: string[];
+  holidayZone?: string;
+}
+
+/** The three tiers a calendar can resolve to. */
+type Tier = 'peak' | 'off-peak' | 'flat';
+
+/** [name, rate spelling, nanodollars] — or the rejection the spelling must raise. */
+type RateCase = [name: string, input: string | number, want: number | RegExp];
+/** [name, [rate, tokens], nanodollars] */
+type CostCase = [name: string, args: [rate: number, tokens: number], want: number];
+/** [name, [nanodollars], rendered] */
+type FormatCase = [name: string, args: [nano: number | null], want: string | null];
+/** [name, instant, billing, expected tier] */
+type TierCase = [name: string, instant: string, billing: Billing, want: Tier];
+/** [name, instant, billing, expected tier] */
+type BoundaryCase = [name: string, from: string, want: string | null, billing?: Billing];
+/** [name, [provider, model], expected model id] */
+type CardCase = [name: string, pair: [provider: string, model: string], want: string];
+/** [name, [provider, model], which side resolves to null] */
+type UnknownCardCase = [name: string, pair: [provider: string, model: string], which: 'provider' | 'model'];
+/** [name, [instant, zone], rendered clock] */
+type ClockCase = [name: string, args: [instant: string, zone: string], want: string];
+
 const settings = resolveSettings({});
 const deepseek = settings.providers.find((p) => p.id === 'deepseek-account');
 const netra = settings.providers.find((p) => p.id === 'netra-runtime');
-const flash = deepseek.models.find((m) => m.model === 'deepseek-flash');
+const flash = deepseek.models.find((m: { model: string }) => m.model === 'deepseek-flash');
 
 /** Every accepted rate spelling, then the ones that must be rejected. */
-const RATE_CASES = [
+const RATE_CASES: RateCase[] = [
   ['a plain decimal', '0.006', 6_000_000],
   ['a whole number', '1.2', 1_200_000_000],
   ['the smallest representable rate', '0.000000001', 1],
@@ -36,14 +65,14 @@ const RATE_CASES = [
   ['a rejection: a negative rate', '-1', /invalid rate/],
 ];
 
-const COST_CASES = [
+const COST_CASES: CostCase[] = [
   ['a full million tokens at the rate', [6_000_000, 1_000_000], 6_000_000],
   ['no tokens', [300_000_000, 0], 0],
   ['no rate', [0, 12_345], 0],
   ['a fractional priced batch: 375,040 cached at $0.006/1M', [6_000_000, 375_040], 2_250_240],
 ];
 
-const FORMAT_CASES = [
+const FORMAT_CASES: FormatCase[] = [
   ['a sub-cent cost', [1_110_000], '0.0011'],
   ['a fractional dollar', [811_900_000], '0.8119'],
   ['whole dollars', [6_000_000_000], '6.0000'],
@@ -52,7 +81,7 @@ const FORMAT_CASES = [
 ];
 
 /** [name, instant, billing, want] — the windows are 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri. */
-const TIER_CASES = [
+const TIER_CASES: TierCase[] = [
   ['inside the first window', '2026-10-15T02:00:00Z', deepseek.billing, PEAK],
   ['inside the gap between windows', '2026-10-15T05:00:00Z', deepseek.billing, OFF_PEAK],
   ['inside the second window', '2026-10-15T07:00:00Z', deepseek.billing, PEAK],
@@ -80,14 +109,14 @@ const TIER_CASES = [
  * transition: the local hour moves, so the tier must move with it. A regression in either half
  * of a transition fails the row that names it.
  */
-const newYorkBilling = {
+const newYorkBilling: Billing = {
   ...deepseek.billing,
   timezone: 'America/New_York',
   weekdays: [1, 2, 3, 4, 5, 6, 7],
   windows: [[1, 3]],
 };
 
-const DST_TIER_CASES = [
+const DST_TIER_CASES: TierCase[] = [
   ['spring forward: 07:00Z before the change is 02:00 EST, inside the window', '2026-03-07T07:00:00Z', newYorkBilling, PEAK],
   ['spring forward: the same 07:00Z after the change is 03:00 EDT, past the window', '2026-03-08T07:00:00Z', newYorkBilling, OFF_PEAK],
   ['fall back: 07:00Z before the change is 03:00 EDT, past the window', '2026-10-31T07:00:00Z', newYorkBilling, OFF_PEAK],
@@ -96,7 +125,7 @@ const DST_TIER_CASES = [
   ['fall back: the repeated 01:30 local, now on EST, is still inside the window', '2026-11-01T06:30:00Z', newYorkBilling, PEAK],
 ];
 
-const BOUNDARY_CASES = [
+const BOUNDARY_CASES: BoundaryCase[] = [
   ['from the off-peak gap', '2026-10-15T04:46:00Z', '2026-10-15T06:00:00Z'],
   ['from inside a peak window', '2026-10-15T02:00:00Z', '2026-10-15T04:00:00Z'],
   ['where peak ends', '2026-10-15T07:00:00Z', '2026-10-15T10:00:00Z'],
@@ -106,18 +135,18 @@ const BOUNDARY_CASES = [
   ['nothing to find for a flat provider', '2026-10-15T04:46:00Z', null, netra.billing],
 ];
 
-const CARD_CASES = [
+const CARD_CASES: CardCase[] = [
   ['an exact model id resolves', ['deepseek-account', 'deepseek-flash'], 'deepseek-flash'],
   ['an alias resolves to its card', ['deepseek-account', 'deepseek-v4.1-flash'], 'deepseek-flash'],
   ['a slashed id resolves against its own provider', ['netra-runtime', 'deepseek/deepseek-v4.1-flash'], 'deepseek/deepseek-v4.1-flash'],
 ];
 
-const UNKNOWN_CARD_CASES = [
+const UNKNOWN_CARD_CASES: UnknownCardCase[] = [
   ['an unknown provider', ['some-router', 'x'], 'provider'],
   ['an unknown model under a known provider', ['deepseek-account', 'nope'], 'model'],
 ];
 
-const CLOCK_CASES = [
+const CLOCK_CASES: ClockCase[] = [
   ['a zone east of UTC', ['2026-10-15T04:46:00Z', 'Asia/Tokyo'], '13:46'],
   ['UTC itself', ['2026-10-15T04:46:00Z', 'UTC'], '04:46'],
 ];
@@ -186,10 +215,12 @@ test('next change: a warm search constructs no formatter at all', () => {
   // constructions is deterministic where a timing assertion would not be.
   const Real = Intl.DateTimeFormat;
   let constructions = 0;
-  globalThis.Intl.DateTimeFormat = function instrumented(...args) {
+  // The spy replaces a global constructor, so its own signature is deliberately loose.
+  const instrumented = function (...args: unknown[]): Intl.DateTimeFormat {
     constructions += 1;
-    return new Real(...args);
+    return new (Real as unknown as new (...rest: unknown[]) => Intl.DateTimeFormat)(...args);
   };
+  globalThis.Intl.DateTimeFormat = instrumented as unknown as typeof Intl.DateTimeFormat;
   try {
     const from = Date.parse('2026-10-15T04:46:00Z');
     nextBoundary(from, deepseek.billing);
@@ -231,7 +262,7 @@ test('cards: an unknown pair resolves to nothing rather than guessing a rate', (
 
 test('price: the four buckets are priced separately and summed', () => {
   const buckets = { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 };
-  const price = priceBuckets(ratesAt(netra.models[0], FLAT), buckets);
+  const price = priceBuckets(ratesAt(netra.models[0], FLAT), buckets)!;
   assert.equal(price.cacheMissNano, costOf(100_000_000, 377), 'input at the miss rate');
   assert.equal(price.cacheHitNano, costOf(10_000_000, 375_040), 'cached at the hit rate');
   assert.equal(price.outputNano, costOf(250_000_000, 910), 'output at the output rate');

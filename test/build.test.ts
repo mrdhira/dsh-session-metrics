@@ -19,9 +19,9 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 /** `src/host/money.ts` is built to `lib/v1/money.js`. */
-const HOST_MODULES = ['index', 'money', 'pricing', 'ledger', 'zod', 'schema', 'settings'];
+const HOST_MODULES: string[] = ['index', 'money', 'pricing', 'ledger', 'zod', 'schema', 'settings'];
 
-const exists = (path) => {
+const exists = (path: string): boolean => {
   try {
     return statSync(path).isFile();
   } catch (error) {
@@ -30,7 +30,7 @@ const exists = (path) => {
 };
 
 test('build: every source module has an artifact, and no artifact predates its source', () => {
-  const pairs = HOST_MODULES.map((name) => [`src/host/${name}.ts`, `lib/v1/${name}.js`]);
+  const pairs: Array<[string, string]> = HOST_MODULES.map((name) => [`src/host/${name}.ts`, `lib/v1/${name}.js`]);
   pairs.push(['src/client/index.cts', 'lib/v1/client.js']);
   const missing = pairs.filter(([, artifact]) => !exists(root + artifact)).map(([, artifact]) => artifact);
   assert.deepEqual(missing, [], 'run `npm run build`: these artifacts do not exist');
@@ -57,7 +57,7 @@ test('build: the host entry is a mirror, and every import it makes is shipped', 
 test('build: no generated file imports something the package does not publish', () => {
   const files = readdirSync(root + 'lib/v1').filter((name) => name.endsWith('.js'));
   assert.ok(files.length >= 3, 'the build should have produced several modules');
-  const broken = [];
+  const broken: string[] = [];
   for (const name of files) {
     const text = readFileSync(root + 'lib/v1/' + name, 'utf8');
     for (const match of text.matchAll(/(?:from|import)\s*\(?\s*["'](\.\/[^"']+)["']/g)) {
@@ -71,7 +71,7 @@ test('build: the entrypoints the Loader reads are the files that exist', () => {
   const main = pkg.main.replace('./', '');
   assert.equal(exists(root + main), true, `main points at a missing file: ${pkg.main}`);
   for (const [key, value] of Object.entries(pkg.exports)) {
-    const target = typeof value === 'string' ? value : value.default;
+    const target = typeof value === 'string' ? value : (value as { default?: string }).default;
     if (target === undefined) continue;
     assert.equal(exists(root + target.replace('./', '')), true, `exports["${key}"] points at a missing file: ${target}`);
   }

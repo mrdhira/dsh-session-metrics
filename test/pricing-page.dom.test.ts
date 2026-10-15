@@ -13,24 +13,49 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Config, resolveSettings } from '../lib/v1/settings.js';
-import { loadBundle, mount, useConfigForms } from './harness.js';
+import { loadBundle, mount, useConfigForms, type MountedView } from './harness.ts';
 
 const resolved = resolveSettings({});
 const shippedProviders = resolved.providers;
 
+/** One recorded `mutate` call, or a refusal. */
+interface FormCall {
+  ops?: any[];
+  expectedRevision?: number;
+  refused?: boolean;
+}
+
+/** A stub Host config form, shaped like the one `ctx.configForms.get(entryId)` returns. */
+interface FormStub {
+  calls: FormCall[];
+  getSnapshot(): Record<string, any>;
+  subscribe(listener: () => void): () => void;
+  mutate(ops: any[], expectedRevision?: number): Promise<boolean>;
+  /** Simulate a write the Host refuses. */
+  refuse(): Promise<boolean>;
+}
+
+/** Overrides for one stub form's snapshot. */
+interface FormOptions {
+  value?: Record<string, any>;
+  base?: Record<string, any>;
+  revision?: number;
+  writability?: string;
+}
+
 /** A stub Host config form, shaped like `ctx.configForms.get(entryId)`. */
-function makeForm({ value = { display: resolved.display, budget: resolved.budget, providers: shippedProviders }, base = { providers: shippedProviders }, revision = 7, writability = 'writable' } = {}) {
-  const calls = [];
-  const listeners = new Set();
+function makeForm({ value = { display: resolved.display, budget: resolved.budget, providers: shippedProviders }, base = { providers: shippedProviders }, revision = 7, writability = 'writable' }: FormOptions = {}): FormStub {
+  const calls: FormCall[] = [];
+  const listeners = new Set<() => void>();
   let snapshot = { value, base, user: {}, revision, writability, persistence: 'host' };
   return {
     calls,
     getSnapshot: () => snapshot,
-    subscribe(listener) {
+    subscribe(listener: () => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    mutate(ops, expectedRevision) {
+    mutate(ops: any[], expectedRevision?: number) {
       calls.push({ ops, expectedRevision });
       snapshot = { ...snapshot, revision: revision + 1 };
       for (const listener of listeners) listener();
@@ -45,7 +70,7 @@ function makeForm({ value = { display: resolved.display, budget: resolved.budget
 }
 
 /** Mount the page with a given configForms stub. */
-function renderPage(configForms) {
+function renderPage(configForms: unknown): MountedView {
   useConfigForms(configForms);
   const loaded = loadBundle();
   const registration = loaded.slot('plugins.row.config');
@@ -54,9 +79,9 @@ function renderPage(configForms) {
   return view;
 }
 
-const entryIdSeen = [];
-const configFormsFor = (form) => ({
-  get(entryId) {
+const entryIdSeen: string[] = [];
+const configFormsFor = (form: unknown) => ({
+  get(entryId: string) {
     entryIdSeen.push(entryId);
     return form;
   },
@@ -90,7 +115,7 @@ test('page: rates are shown in USD per 1M, never the nanodollar form', () => {
   const form = makeForm();
   const view = renderPage(configFormsFor(form));
   try {
-    const rateInputs = [...view.container.querySelectorAll('.dsm-rates input')].map((node) => node.value);
+    const rateInputs = [...view.container.querySelectorAll<HTMLInputElement>('.dsm-rates input')].map((node) => node.value);
     assert.ok(rateInputs.length > 0, 'expected rate fields');
     assert.ok(rateInputs.includes('0.006'), `expected $0.006 among ${JSON.stringify(rateInputs)}`);
     assert.ok(rateInputs.includes('0.3'), `expected $0.30 among ${JSON.stringify(rateInputs)}`);
@@ -117,8 +142,8 @@ test('page: editing a rate stages a change and saving writes providers once', as
     assert.equal(expectedRevision, 7, 'the revision read when editing began guards the write');
     // As a string: the ops array is built in the bundle's VM realm, so a strict
     // structural comparison against a host array would fail on the prototype alone.
-    assert.equal(ops.map((op) => `${op.op}:${op.path.join('.')}`).join(','), 'set:providers', 'providers is written as one field');
-    const flash = ops[0].value.find((provider) => provider.id === 'deepseek-account').models.find((model) => model.model === 'deepseek-flash');
+    assert.equal(ops!.map((op) => `${op.op}:${op.path.join('.')}`).join(','), 'set:providers', 'providers is written as one field');
+    const flash = ops![0].value.find((provider: any) => provider.id === 'deepseek-account').models.find((model: any) => model.model === 'deepseek-flash');
     assert.equal(flash.rates.peak.cacheHit, '0.05', 'the edited USD decimal is written back, not a nanodollar count');
     assert.equal(flash.rates.peak.output, '1.2', 'untouched rates keep their USD form');
   } finally {
@@ -132,7 +157,7 @@ test('page: discarding restores the resolved values', async () => {
   try {
     await view.type('.dsm-rates input', '9.99');
     assert.match(view.text(), /unsaved changes/);
-    await view.clickNode(view.control('discard'));
+    await view.clickNode(view.control('discard')!);
     assert.equal(form.calls.length, 0, 'discarding must not write');
   } finally {
     view.unmount();
@@ -144,13 +169,13 @@ test('page: reset to shipped restores the inherited card', async () => {
   const view = renderPage(configFormsFor(form));
   try {
     await view.type('.dsm-rates input', '9.99');
-    const before = view.container.querySelectorAll('.dsm-rates input')[0].value;
+    const before = view.container.querySelectorAll<HTMLInputElement>('.dsm-rates input')[0].value;
     assert.equal(before, '9.99');
     // The reset button is the first control inside the first provider card head.
     const reset = view.control('reset to shipped');
     assert.ok(reset !== undefined, 'expected a reset control');
     await view.clickNode(reset);
-    assert.equal(view.container.querySelectorAll('.dsm-rates input')[0].value, '0.006', 'the shipped rate returns');
+    assert.equal(view.container.querySelectorAll<HTMLInputElement>('.dsm-rates input')[0].value, '0.006', 'the shipped rate returns');
     assert.equal(form.calls.length, 0, 'resetting locally must not write');
   } finally {
     view.unmount();
@@ -161,14 +186,14 @@ test('page: adding and removing providers and models edits the draft', async () 
   const form = makeForm();
   const view = renderPage(configFormsFor(form));
   try {
-    await view.clickNode(view.control('+ provider'));
+    await view.clickNode(view.control('+ provider')!);
     assert.equal(view.container.querySelectorAll('.dsm-card').length, 4, 'a new provider card appears');
     assert.match(view.text(), /new-provider/);
 
-    await view.clickNode(view.control('+ model'));
+    await view.clickNode(view.control('+ model')!);
     assert.match(view.text(), /new-model/);
 
-    await view.clickNode([...view.container.querySelectorAll('.dsm-cardHead .dsm-toggle')].find((node) => node.textContent === 'remove'));
+    await view.clickNode([...view.container.querySelectorAll('.dsm-cardHead .dsm-toggle')].find((node) => node.textContent === 'remove')!);
     assert.equal(view.container.querySelectorAll('.dsm-card').length, 3, 'removing a provider drops its card');
   } finally {
     view.unmount();
@@ -179,12 +204,12 @@ test('page: peak windows and zones are editable and parsed back', async () => {
   const form = makeForm();
   const view = renderPage(configFormsFor(form));
   try {
-    const windowInput = [...view.container.querySelectorAll('.dsm-input')].find((node) => node.placeholder && node.placeholder.includes('empty = flat'));
+    const windowInput = [...view.container.querySelectorAll<HTMLInputElement>('.dsm-input')].find((node) => node.placeholder && node.placeholder.includes('empty = flat'));
     assert.ok(windowInput !== undefined, 'expected a peak-windows field');
     assert.equal(windowInput.value, '1-4,6-10', 'the shipped DeepSeek windows are shown');
     await view.type('.dsm-input[placeholder*="empty = flat"]', '2-5');
-    const updated = [...view.container.querySelectorAll('.dsm-input')].find((node) => node.placeholder && node.placeholder.includes('empty = flat'));
-    assert.equal(updated.value, '2-5');
+    const updated = [...view.container.querySelectorAll<HTMLInputElement>('.dsm-input')].find((node) => node.placeholder && node.placeholder.includes('empty = flat'));
+    assert.equal(updated!.value, '2-5');
   } finally {
     view.unmount();
   }
@@ -195,8 +220,8 @@ test('page: a refused write keeps the edits and says so', async () => {
   const view = renderPage(configFormsFor(form));
   try {
     // Read-only snapshots render the controls but the save button is disabled.
-    const save = view.container.querySelector('.dsm-primary');
-    assert.equal(save.disabled, true, 'a read-only snapshot cannot be saved');
+    const save = view.container.querySelector<HTMLButtonElement>('.dsm-primary');
+    assert.equal(save!.disabled, true, 'a read-only snapshot cannot be saved');
   } finally {
     view.unmount();
   }
@@ -211,7 +236,7 @@ test('page: the inline bundle surface points at the row editor instead of lookin
     assert.match(view.text(), /edited on the row page/, 'and the tag says where the editor lives');
     const path = view.container.querySelector('.dsm-path');
     assert.ok(path !== null, 'the path is emphasised rather than buried in a sentence');
-    assert.match(path.textContent, /dsh-session-metrics/, 'and it names the plugin');
+    assert.match(path.textContent!, /dsh-session-metrics/, 'and it names the plugin');
     assert.equal(view.container.querySelector('pre'), null, 'no empty config block');
   } finally {
     view.unmount();
@@ -243,7 +268,7 @@ test('the stored shape renders: a flat model must not be read as a peak one', ()
   try {
     assert.equal(view.text().includes('session-metrics failed'), false, `must not crash: ${view.text().slice(0, 140)}`);
     assert.equal(view.container.querySelectorAll('.dsm-card').length, 2, 'one card per stored provider');
-    const rates = [...view.container.querySelectorAll('.dsm-rates input')].map((node) => node.value);
+    const rates = [...view.container.querySelectorAll<HTMLInputElement>('.dsm-rates input')].map((node) => node.value);
     assert.ok(rates.includes('0.006'), 'the peak row is editable');
     assert.ok(rates.includes('0.01'), 'the flat row is editable too');
   } finally {
@@ -263,8 +288,8 @@ test('editing a flat model writes to rates.flat and the payload validates agains
 
     assert.equal(writes.length, 1, 'one write');
     const payload = writes[0].ops[0].value;
-    assert.equal(payload.find((p) => p.id === 'netra-runtime').models[0].rates.flat.cacheHit, '0.02', 'written to rates.flat');
-    assert.equal(payload.find((p) => p.id === 'deepseek-account').models[0].rates.peak.cacheHit, '0.006', 'the peak model is untouched');
+    assert.equal(payload.find((p: any) => p.id === 'netra-runtime').models[0].rates.flat.cacheHit, '0.02', 'written to rates.flat');
+    assert.equal(payload.find((p: any) => p.id === 'deepseek-account').models[0].rates.peak.cacheHit, '0.006', 'the peak model is untouched');
 
     // THE verification: the Host must accept exactly what we send it.
     const result = Config['~standard'].validate({ providers: payload });
@@ -282,7 +307,7 @@ test('switching a model between flat and peak keeps exactly one rate row', async
     await view.clickNode(peakToggle);
     await view.click('.dsm-primary');
     await new Promise((resolve) => setTimeout(resolve, 0));
-    const rates = writes[0].ops[0].value.find((p) => p.id === 'netra-runtime').models[0].rates;
+    const rates = writes[0].ops[0].value.find((p: any) => p.id === 'netra-runtime').models[0].rates;
     assert.equal(rates.flat, undefined, 'the flat row is gone after switching to peak');
     assert.notEqual(rates.peak, undefined, 'a peak row exists');
     const result = Config['~standard'].validate({ providers: writes[0].ops[0].value });
@@ -296,26 +321,26 @@ test('after saving, a stale snapshot must not make the edit look reverted', asyn
   // Reproduced live: the owner-supplied form has no subscription, so the snapshot on the
   // next render still carried the OLD value. The write had persisted, but the page showed
   // the old number and looked like a rollback.
-  const writes = [];
+  const writes: any[] = [];
   const form = {
     state: { value: { providers: schemaShaped }, user: {}, revision: 7, writable: true },
-    mutate: (ops, revision) => { writes.push({ ops, revision }); return Promise.resolve(true); },
+    mutate: (ops: any[], revision: number) => { writes.push({ ops, revision }); return Promise.resolve(true); },
   };
   useConfigForms(undefined);
   const loaded = loadBundle();
   const view = mount(loaded, loaded.slot('plugins.row.config'), { view: 'page', form, surface: 'row' });
   try {
     const netraCard = view.container.querySelectorAll('.dsm-card')[1];
-    const rateInput = netraCard.querySelector('.dsm-rates input');
-    assert.equal(rateInput.value, '0.01', 'the stored netra cache-hit rate');
+    const rateInput = netraCard.querySelector<HTMLInputElement>('.dsm-rates input');
+    assert.equal(rateInput!.value, '0.01', 'the stored netra cache-hit rate');
     await view.typeNode(rateInput, '0.02');
     await view.click('.dsm-primary');
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(writes.length, 1, 'the write happened');
     assert.match(view.text(), /Saved\./, 'the page confirms the save');
-    const after = view.container.querySelectorAll('.dsm-card')[1].querySelector('.dsm-rates input');
-    assert.equal(after.value, '0.02', 'and keeps showing what was written, not the stale snapshot');
+    const after = view.container.querySelectorAll('.dsm-card')[1].querySelector<HTMLInputElement>('.dsm-rates input');
+    assert.equal(after!.value, '0.02', 'and keeps showing what was written, not the stale snapshot');
     assert.equal(view.text().includes('no changes'), true, 'the draft counts as clean');
   } finally {
     view.unmount();
@@ -378,7 +403,7 @@ test('robustness: a render failure is reported in the UI instead of vanishing', 
     const text = view.text();
     assert.match(text, /session-metrics failed/);
     assert.match(text, /boom from the config service/);
-    assert.equal(view.container.querySelector('.dsm-slot').getAttribute('data-safe'), 'false');
+    assert.equal(view.container.querySelector('.dsm-slot')!.getAttribute('data-safe'), 'false');
   } finally {
     view.unmount();
   }
@@ -413,7 +438,7 @@ test('robustness: every partial config shape the Host can serve renders without 
   // Reproduced live: a value layer carrying only some fields threw
   // `"undefined" is not valid JSON` from the number formatting, and a missing `display`
   // threw on `.labels`. A config layer can legitimately be partial.
-  const shapes = [
+  const shapes: Array<[string, Record<string, any> | undefined]> = [
     ['value {} (empty)', { value: {}, base: undefined }],
     ['value {budget}', { value: { budget: { sessionUsd: 5 } }, base: undefined }],
     ['value {providers: []}', { value: { providers: [] }, base: undefined }],
@@ -463,11 +488,11 @@ const schemaShaped = [
 ];
 
 /** Mount the page with a schema-shaped config layer and capture writes. */
-function mountStoredConfig() {
-  const writes = [];
+function mountStoredConfig(): { view: MountedView; writes: any[] } {
+  const writes: any[] = [];
   const form = {
     state: { value: { providers: schemaShaped }, base: undefined, user: {}, revision: 9, writable: true },
-    mutate: (ops, revision) => { writes.push({ ops, revision }); return Promise.resolve(true); },
+    mutate: (ops: any[], revision: number) => { writes.push({ ops, revision }); return Promise.resolve(true); },
   };
   useConfigForms(undefined);
   const loaded = loadBundle();

@@ -33,12 +33,12 @@
   ],
   "scripts": {
     "guard": "node scripts/guard.mjs",
-    "test": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=384 --test --test-isolation=none --test-timeout=20000 --test-force-exit \"test/*.test.js\"",
-    "test:fast": "node scripts/guard.mjs --limit-mb 512 -- node --max-old-space-size=256 --test --test-isolation=none --test-timeout=20000 --test-force-exit test/pricing.test.js test/settings.test.js test/ledger.test.js",
-    "test:dom": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=20000 --test-force-exit test/client.dom.test.js test/pricing-page.dom.test.js",
-    "test:replay": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=30000 --test-force-exit test/replay.test.js",
+    "test": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=384 --test --test-isolation=none --test-timeout=20000 --test-force-exit \"test/*.test.ts\"",
+    "test:fast": "node scripts/guard.mjs --limit-mb 512 -- node --max-old-space-size=256 --test --test-isolation=none --test-timeout=20000 --test-force-exit test/pricing.test.ts test/settings.test.ts test/ledger.test.ts",
+    "test:dom": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=20000 --test-force-exit test/client.dom.test.ts test/pricing-page.dom.test.ts",
+    "test:replay": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=30000 --test-force-exit test/replay.test.ts",
     "build": "node build.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.dynamic.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.dynamic.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "pretest": "npm run build"
   },
   "dsh": {
@@ -54,6 +54,10 @@
     }
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
+    "@types/node": "^24.19.2",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "esbuild": "^0.28.2",
     "jsdom": "^30.1.2",
     "react": "^18.3.1",

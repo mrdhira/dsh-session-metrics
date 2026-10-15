@@ -16,10 +16,31 @@ import assert from 'node:assert/strict';
 
 import { resolveSettings } from '../lib/v1/settings.js';
 import { findCard, priceBuckets, ratesAt, savingsNano, tierAt } from '../lib/v1/pricing.js';
-import { loadBundle, mount } from './harness.js';
+import { loadBundle, mount, type MountedView } from './harness.ts';
+
+/** The four billing buckets the strip prices. */
+interface Buckets {
+  uncachedInputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+/** One provider/model pair the matrix drives. */
+interface Pair {
+  provider: string;
+  model: string;
+}
+
+/** What one mounted strip lets a case read. */
+interface RenderedStrip {
+  view: MountedView;
+  tier: string;
+  props: Record<string, unknown>;
+}
 
 /** The strip's rounding, restated so the expectation is independent of the implementation. */
-const shown = (nano) => {
+const shown = (nano: number | null | undefined): string | null => {
   if (nano === null || nano === undefined) return null;
   const cents = Math.round(Math.abs(nano) / 1e7);
   if (cents === 0 && nano > 0) return '< $0.01';
@@ -28,14 +49,14 @@ const shown = (nano) => {
 
 const settings = resolveSettings({});
 
-const MIXES = [
+const MIXES: Buckets[] = [
   { uncachedInputTokens: 1_234, cacheReadTokens: 410_450_000, cacheWriteTokens: 0, outputTokens: 976_600 },
   { uncachedInputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1 },
   { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 500_000, outputTokens: 250_000 },
   { uncachedInputTokens: 999_999, cacheReadTokens: 1_000_000, cacheWriteTokens: 12_345, outputTokens: 987_654 },
 ];
 
-const PAIRS = [
+const PAIRS: Pair[] = [
   { provider: 'deepseek-account', model: 'deepseek-flash' },
   { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
   { provider: 'netra-runtime', model: 'deepseek/deepseek-v4.1-flash' },
@@ -44,14 +65,14 @@ const PAIRS = [
 ];
 
 /** Mount the strip for one pair+mix and return its rendered money and tier. */
-function renderStrip(pair, buckets, nowMs) {
+function renderStrip(pair: Pair, buckets: Buckets, nowMs: number): RenderedStrip {
   const tier = tierAt(new Date(nowMs), findCard(settings.providers, pair.provider, pair.model).provider.billing);
   const key = [pair.provider, pair.model, tier].join('\u0000');
   const ledger = { turns: 1, steps: 1, totals: { [key]: buckets }, rows: [] };
   const loaded = loadBundle();
   const props = {
     sessionId: 'parity',
-    useProjection: (name) => {
+    useProjection: (name: string) => {
       if (name === 'sessionMetrics') return { version: 1, settings, ledger };
       if (name === 'tokenUsage') return buckets;
       if (name === 'modelSelection') return { lastUsed: { provider: pair.provider, model: pair.model } };
@@ -64,7 +85,7 @@ function renderStrip(pair, buckets, nowMs) {
 
 test('parity: the strip prices every card, tier and token mix exactly as the host does', () => {
   const nowMs = Date.now();
-  const mismatches = [];
+  const mismatches: string[] = [];
   let checked = 0;
   for (const pair of PAIRS) {
     const card = findCard(settings.providers, pair.provider, pair.model);
@@ -74,8 +95,8 @@ test('parity: the strip prices every card, tier and token mix exactly as the hos
       try {
         const text = view.text();
         const rates = ratesAt(card.model, tier);
-        const price = priceBuckets(rates, buckets);
-        const saved = savingsNano(rates, buckets);
+        const price = priceBuckets(rates, buckets)!;
+        const saved = savingsNano(rates, buckets)!;
         checked += 1;
         const cost = shown(price.totalNano);
         if (!text.includes('Cost' + cost)) mismatches.push(`${pair.provider}/${pair.model} ${tier}: cost ${cost} not in "${text}"`);
@@ -94,7 +115,7 @@ test('parity: the strip prices every card, tier and token mix exactly as the hos
 
 test('parity: the tier the strip shows is the tier the host computes', () => {
   const nowMs = Date.now();
-  const disagreements = [];
+  const disagreements: string[] = [];
   for (const pair of PAIRS) {
     const { view, tier } = renderStrip(pair, MIXES[0], nowMs);
     try {
@@ -128,8 +149,8 @@ test('parity: the strip renders its clock, and schedules a tick aligned to the m
   // open. It now re-renders on a minute boundary, and only while a clock chip is on screen.
   const win = loadBundle().dom.window;
   const real = win.setTimeout;
-  const scheduled = [];
-  win.setTimeout = (fn, ms) => { scheduled.push(ms); return real(fn, ms); };
+  const scheduled: number[] = [];
+  win.setTimeout = (fn: () => void, ms: number) => { scheduled.push(ms); return real(fn, ms); };
   const { view, props } = renderStrip(PAIRS[0], MIXES[0], Date.now());
   try {
     view.rerender(props); // the effect re-runs with the spy installed
@@ -146,14 +167,14 @@ test('parity: the strip renders its clock, and schedules a tick aligned to the m
 test('parity: a config with no clock chip schedules no timer at all', () => {
   const win = loadBundle().dom.window;
   const real = win.setTimeout;
-  const scheduled = [];
-  win.setTimeout = (fn, ms) => { scheduled.push(ms); return real(fn, ms); };
+  const scheduled: number[] = [];
+  win.setTimeout = (fn: () => void, ms: number) => { scheduled.push(ms); return real(fn, ms); };
   const quiet = resolveSettings({ display: { labels: ['cost', 'provider'] } });
   const buckets = MIXES[0];
   const loaded = loadBundle();
   const props = {
     sessionId: 'parity',
-    useProjection: (name) => {
+    useProjection: (name: string) => {
       if (name === 'sessionMetrics') {
         return { version: 1, settings: quiet, ledger: { turns: 1, steps: 1, totals: { 'deepseek-account\u0000deepseek-flash\u0000peak': buckets }, rows: [] } };
       }

@@ -11,14 +11,58 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveSettings } from '../lib/v1/settings.js';
-import { loadBundle, mount } from './harness.js';
+import { loadBundle, mount, type MountedView } from './harness.ts';
 import { priceBuckets, ratesAt, findCard } from '../lib/v1/pricing.js';
 import { formatUsd } from '../lib/v1/money.js';
 
+/** The four billing buckets the strip prices. */
+interface Buckets {
+  uncachedInputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
 
+/** One ledger row, as the projection carries it. */
+interface LedgerRow {
+  turn: number;
+  step: number;
+  startTime: number;
+  endTime: number;
+  provider: string;
+  model: string;
+  tier: string;
+  buckets: Buckets;
+}
+
+/** The ledger projection the strip reads. */
+interface LedgerFixture {
+  turns: number;
+  steps: number;
+  totals: Record<string, Buckets>;
+  rows: LedgerRow[];
+}
+
+/** The resolved settings object, as the module returns it. */
+type SettingsFixture = ReturnType<typeof resolveSettings>;
+
+/** The model-selection projection, when the session has one. */
+interface SelectionFixture {
+  lastUsed: { provider: string; model: string };
+}
+
+/** Everything a case can hand the strip. */
+interface RenderArgs {
+  ledger?: LedgerFixture | null;
+  settings?: SettingsFixture;
+  selection?: SelectionFixture | null;
+  usage?: Buckets | null;
+  projectionMissing?: boolean;
+  sessionId?: string;
+}
 
 /** Mount the strip with fixed projection values. */
-function render(args) {
+function render(args: RenderArgs): MountedView & { clickTrigger: () => Promise<void> } {
   const { ledger, settings, selection, usage, projectionMissing = false } = args;
   // `hasOwnProperty` rather than a default parameter: a test that passes
   // `sessionId: undefined` on purpose must reach the component as undefined, or the
@@ -26,7 +70,7 @@ function render(args) {
   const sessionId = Object.prototype.hasOwnProperty.call(args, 'sessionId') ? args.sessionId : 'session-test';
   const loaded = loadBundle();
   const registration = loaded.slot('conversation.input.dock');
-  const useProjection = (key) => {
+  const useProjection = (key: string) => {
     if (key === 'sessionMetrics') return projectionMissing ? undefined : { version: 1, settings, ledger };
     if (key === 'tokenUsage') return usage;
     if (key === 'modelSelection') return selection;
@@ -42,7 +86,7 @@ function render(args) {
 const settings = resolveSettings({ display: { primaryProvider: 'deepseek-account' } });
 
 /** One $1.0944 peak step on the shipped DeepSeek card. */
-const ledger = {
+const ledger: LedgerFixture = {
   turns: 1,
   steps: 1,
   totals: {
@@ -60,8 +104,8 @@ const ledger = {
   }],
 };
 
-const selection = { lastUsed: { provider: 'deepseek-account', model: 'deepseek-flash' } };
-const usage = { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 };
+const selection: SelectionFixture = { lastUsed: { provider: 'deepseek-account', model: 'deepseek-flash' } };
+const usage: Buckets = { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 };
 
 test('registration: the strip passes only the options its slot declares', () => {
   // `conversation.input.dock` declares `id`, `order`, `label` and nothing else. An
@@ -84,7 +128,7 @@ test('labels: the strip shows peak state, the clock, cost, savings and provider 
     // 910 output tokens at $1.20/1M plus the cached and uncached prompt is a third of a
     // cent, so this fixture also pins the sub-cent display.
     const card = findCard(settings.providers, 'deepseek-account', 'deepseek-flash');
-    const expected = priceBuckets(ratesAt(card.model, 'peak'), ledger.rows[0].buckets).totalNano;
+    const expected = priceBuckets(ratesAt(card.model, 'peak'), ledger.rows[0].buckets)!.totalNano;
     assert.equal(formatUsd(expected, 4), '0.0034', 'the fixture prices to a third of a cent');
     assert.match(text, /< \$0\.01/, `a session that cost something must not read as free: ${text}`);
     assert.match(text, /Cost/);
@@ -93,11 +137,11 @@ test('labels: the strip shows peak state, the clock, cost, savings and provider 
     assert.match(text, /(ON|OFF) PEAK HOURS/, 'the tier is legible without clicking');
     assert.match(text, /\d\d:\d\d/, 'a 24-hour clock');
     const zone = (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC').split('/').pop();
-    assert.equal(text.includes(zone), true, `the clock names the viewer zone: ${text}`);
+    assert.equal(text.includes(zone!), true, `the clock names the viewer zone: ${text}`);
     const trigger = view.container.querySelector('.dsm-trigger');
     assert.ok(trigger !== null);
-    assert.equal(trigger.textContent.includes('deepseek-flash'), false, 'no model chip in the strip');
-    assert.equal(trigger.textContent.includes('session-metrics/v'), false, 'no build tag in the strip');
+    assert.equal(trigger.textContent!.includes('deepseek-flash'), false, 'no model chip in the strip');
+    assert.equal(trigger.textContent!.includes('session-metrics/v'), false, 'no build tag in the strip');
   } finally {
     view.unmount();
   }
@@ -123,14 +167,14 @@ test('labels: peak is an up triangle and off-peak a down triangle, in the app co
     const off = view.container.querySelector('.dsm-off');
     assert.equal(peak === null && off === null, false, 'the tier chip is present at any hour');
     if (peak !== null) {
-      assert.equal(peak.textContent.includes('\u25b2'), true, 'peak points up');
-      assert.equal(peak.textContent.includes('ON'), true, 'peak reads ON');
+      assert.equal(peak.textContent!.includes('\u25b2'), true, 'peak points up');
+      assert.equal(peak.textContent!.includes('ON'), true, 'peak reads ON');
     }
     if (off !== null) {
-      assert.equal(off.textContent.includes('\u25bc'), true, 'off-peak points down');
-      assert.equal(off.textContent.includes('OFF'), true, 'off-peak reads OFF');
+      assert.equal(off.textContent!.includes('\u25bc'), true, 'off-peak points down');
+      assert.equal(off.textContent!.includes('OFF'), true, 'off-peak reads OFF');
     }
-    const css = [...view.container.ownerDocument.querySelectorAll('style[data-plugin-css]')]
+    const css = [...view.container.ownerDocument!.querySelectorAll('style[data-plugin-css]')]
       .map((node) => node.textContent).join('');
     assert.match(css, /\.dsm-peak\{color:var\(--dsw-alias-state-error-primary/, 'peak uses the error colour');
     assert.match(css, /\.dsm-off\{color:var\(--dsw-alias-state-success-primary/, 'off-peak uses the success colour');
@@ -148,7 +192,7 @@ test('labels: the provider chip shows unless the config names it as primary', ()
   }
   const hidden = render({ ledger, settings, selection, usage });
   try {
-    assert.equal(hidden.container.querySelector('.dsm-trigger').textContent.includes('deepseek-account'), false,
+    assert.equal(hidden.container.querySelector('.dsm-trigger')!.textContent!.includes('deepseek-account'), false,
       'primaryProvider suppresses the chip');
   } finally {
     hidden.unmount();
@@ -208,7 +252,7 @@ test('details: a metric explanation floats above the panel, clamped to the viewp
       assert.equal((hint.getAttribute('aria-label') || '').length > 20, true, 'named for assistive technology');
     }
     // The box is portalled, so it lives in the document rather than in the slot subtree.
-    const findBox = () => view.container.ownerDocument.querySelector('.dsm-tipBox');
+    const findBox = () => view.container.ownerDocument!.querySelector('.dsm-tipBox');
     assert.equal(findBox() === null, true, 'nothing floats until hovered');
 
     await view.hover(hints[0]);
@@ -216,14 +260,14 @@ test('details: a metric explanation floats above the panel, clamped to the viewp
     assert.ok(box !== null, 'hovering reveals the explanation');
     assert.equal(box.getAttribute('role'), 'tooltip');
     // Portalled to the body: no scroll container or transformed ancestor can clip it.
-    assert.equal(box.parentElement === view.container.ownerDocument.body, true,
+    assert.equal(box.parentElement === view.container.ownerDocument!.body, true,
       `the explanation must escape the panel: ${box.parentElement && box.parentElement.className}`);
-    assert.equal(box.textContent.length > 20, true, `thin explanation: ${box.textContent}`);
+    assert.equal(box.textContent!.length > 20, true, `thin explanation: ${box.textContent}`);
     const style = box.getAttribute('style') || '';
     assert.match(style, /left: \d+px/, 'positioned in viewport coordinates');
     // Clamped, so a right-hand column cannot push the box off screen or under the panel edge.
     assert.match(style, /left: (1[2-9]|[2-9]\d|\d{3,})px/, `clamped from the left edge: ${style}`);
-    const css = [...view.container.ownerDocument.querySelectorAll('style[data-plugin-css]')]
+    const css = [...view.container.ownerDocument!.querySelectorAll('style[data-plugin-css]')]
       .map((node) => node.textContent).join('');
     assert.match(css, /\.dsm-tipBox\{position:fixed/, 'fixed, so the scrolling panel cannot clip it');
     assert.match(css, /max-width:min\(320px,calc\(100vw - 24px\)\)/, 'hugging its text, clamped to the window');
@@ -234,9 +278,9 @@ test('details: a metric explanation floats above the panel, clamped to the viewp
 
     // The reported bug: a label near the right edge pushed the box past the window and it
     // was cropped. A clamped left coordinate keeps the whole box on screen.
-    const win = view.container.ownerDocument.defaultView;
+    const win = view.container.ownerDocument!.defaultView!;
     const farRight = hints[0];
-    farRight.getBoundingClientRect = () => ({ left: win.innerWidth - 20, right: win.innerWidth, top: 300, bottom: 316, width: 20, height: 16 });
+    farRight.getBoundingClientRect = () => ({ left: win.innerWidth - 20, right: win.innerWidth, top: 300, bottom: 316, width: 20, height: 16 }) as DOMRect;
     await view.hover(farRight);
     const clamped = findBox();
     assert.ok(clamped !== null, 'the explanation opens for a right-edge label');
@@ -261,7 +305,7 @@ test('details: the model provider table names the peak-hour state per row', asyn
     assert.equal(cells.length, 3, 'provider, model, peak hours');
     assert.equal(cells[0], 'deepseek-account');
     assert.equal(cells[1], 'DeepSeek V4.1 Flash', `the card's own label, not the internal key: ${cells[1]}`);
-    assert.equal(['On', 'Off', 'None'].includes(cells[2]), true, `peak hours cell: ${cells[2]}`);
+    assert.equal(['On', 'Off', 'None'].includes(cells[2] as string), true, `peak hours cell: ${cells[2]}`);
   } finally {
     view.unmount();
   }
@@ -296,7 +340,7 @@ test('placement: sticky like the composer, with no shipped stylesheet override',
     // than pinning pixels, or the widget cannot scale with it.
     assert.match(css, /font-size:calc\(var\(--dsh-content-font-size,14px\)/, 'sized from the app variable');
     assert.equal(/font-size:\d+px/.test(css), false, 'no hardcoded pixel sizes');
-    assert.equal(view.container.querySelector('.dsm-slot').getAttribute('data-safe'), 'true');
+    assert.equal(view.container.querySelector('.dsm-slot')!.getAttribute('data-safe'), 'true');
   } finally {
     view.unmount();
   }
@@ -326,9 +370,9 @@ test('robustness: a missing projection explains itself instead of vanishing', ()
   try {
     const chip = view.container.querySelector('.dsm-trigger');
     assert.ok(chip !== null, 'a silent panel is undiagnosable; the strip must say what it waits for');
-    assert.equal(view.container.querySelector('.dsm-slot').getAttribute('data-safe'), 'false');
+    assert.equal(view.container.querySelector('.dsm-slot')!.getAttribute('data-safe'), 'false');
     assert.match(view.text(), /waiting/);
-    assert.match(chip.getAttribute('title'), /the projection carries no ledger/, 'the reason names the absent half');
+    assert.match(chip.getAttribute('title')!, /the projection carries no ledger/, 'the reason names the absent half');
   } finally {
     view.unmount();
   }

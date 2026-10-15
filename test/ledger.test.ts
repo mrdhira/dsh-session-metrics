@@ -16,19 +16,96 @@ import assert from 'node:assert/strict';
 import { initLedgerState, createLedgerApply, toLedgerView, groupKey, bucketsFrom } from '../lib/v1/ledger.js';
 import { sessionMetricsWireSchema } from '../lib/v1/schema.js';
 
+/** The four billing buckets a usage report normalizes into. */
+interface Buckets {
+  uncachedInputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+/** A raw usage report as an event carries it: counts may be absent, or the provider's bug. */
+interface UsageReport {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+/** One session event, as the fold consumes it. */
+interface SessionEvent {
+  type: string;
+  time?: number;
+  data?: Record<string, any>;
+}
+
+/** A ledger row; the fold cases index it by field name, so it stays open. */
+type LedgerRow = Record<string, any>;
+
+/** The state fields these cases read. */
+interface LedgerState {
+  turns: number;
+  steps: number;
+  totals: Record<string, Buckets>;
+  rows: LedgerRow[];
+  openIndex?: number | null;
+  lastProvider?: string | null;
+  lastModel?: string | null;
+}
+
+/** The fold, as `createLedgerApply` returns it. */
+type LedgerApply = (state: LedgerState, event: SessionEvent) => LedgerState;
+
+/** The state a case pins; only the fields it names are asserted. */
+interface FoldWant {
+  steps?: number;
+  turns?: number;
+  rows?: number;
+  firstRow?: Record<string, any>;
+  lastRowStep?: number;
+  firstRowStep?: number;
+  models?: string[];
+  groupCount?: number;
+  groupKeys?: string[];
+  groupSuffix?: string;
+  ordered?: boolean;
+  totals?: Record<string, Buckets>;
+}
+
+/** One event sequence and the state it must fold into. */
+interface FoldCase {
+  name: string;
+  events: () => SessionEvent[];
+  apply?: LedgerApply;
+  want: FoldWant;
+}
+
+/** One step's options; every field but the time has a default. */
+interface StepOptions {
+  turn?: number;
+  step?: number;
+  time: number;
+  provider?: string;
+  model?: string;
+  usage?: UsageReport;
+}
+
+/** [name, usage report, expected buckets] — `null` means "not a billable report". */
+type BucketCase = [name: string, usage: UsageReport | null, want: Buckets | null];
+
 const BASE = Date.parse('2026-10-15T01:00:00Z');
 const peakKey = groupKey('deepseek-account', 'deepseek-flash', 'peak');
 const fold = createLedgerApply({ tierFor: () => 'peak' });
 
 /** Drive a sequence of events through the fold. */
-function run(events, apply = fold) {
-  let state = initLedgerState();
+function run(events: SessionEvent[], apply: LedgerApply = fold): LedgerState {
+  let state = initLedgerState() as LedgerState;
   for (const event of events) state = apply(state, event);
   return state;
 }
 
 /** A complete step on one provider/model. */
-function step({ turn = 1, step: index = 1, time, provider = 'deepseek-account', model = 'deepseek-flash', usage }) {
+function step({ turn = 1, step: index = 1, time, provider = 'deepseek-account', model = 'deepseek-flash', usage }: StepOptions): SessionEvent[] {
   return [
     { type: 'request/header', time, data: { header: { config: { provider, model } } } },
     { type: 'step/start', time, data: { turn, step: index } },
@@ -38,7 +115,7 @@ function step({ turn = 1, step: index = 1, time, provider = 'deepseek-account', 
 }
 
 /** Usage reports in, billing buckets out. `null` means "not a billable report". */
-const BUCKET_CASES = [
+const BUCKET_CASES: BucketCase[] = [
   ['every bucket present', { inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 },
     { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 }],
   ['only input, everything else absent', { inputTokens: 10 },
@@ -54,7 +131,7 @@ const BUCKET_CASES = [
 ];
 
 /** Event sequences and the state they must fold into. */
-const FOLD_CASES = [
+const FOLD_CASES: FoldCase[] = [
   {
     name: 'one step records one row and one group',
     events: () => step({ time: BASE, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 1000 } }),
@@ -128,7 +205,7 @@ const FOLD_CASES = [
   {
     name: 'a long session trims rows but never loses money',
     events: () => {
-      const events = [];
+      const events: SessionEvent[] = [];
       for (let index = 1; index <= 260; index += 1) {
         events.push(...step({ step: index, time: BASE + index * 1000, usage: { inputTokens: 1, outputTokens: 1 } }));
       }
@@ -143,7 +220,7 @@ const FOLD_CASES = [
   {
     name: 'trimming drops the oldest rows and keeps the rest in order',
     events: () => {
-      const events = [];
+      const events: SessionEvent[] = [];
       for (let index = 1; index <= 205; index += 1) {
         events.push(...step({ step: index, time: BASE + index * 1000, usage: { inputTokens: 1, outputTokens: 1 } }));
       }
