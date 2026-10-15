@@ -1,0 +1,228 @@
+/**
+ * The ledger fold.
+ *
+ * The ledger is the only structure this plugin folds from session events, so these cases pin
+ * the properties the design depends on: one row per step, priced at that step's own model;
+ * retries overwrite rather than double-count; totals stay whole while rows are trimmed; and
+ * the wire view is plain JSON the Host's schema accepts.
+ *
+ * Table-driven, positive cases first: a single step, then accumulation, then the awkward
+ * inputs (retries, empty usage, unknown providers, trimming).
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { initLedgerState, createLedgerApply, toLedgerView, groupKey, bucketsFrom } from '../lib/v1/ledger.js';
+import { sessionMetricsWireSchema } from '../lib/v1/schema.js';
+
+const BASE = Date.parse('2026-10-15T01:00:00Z');
+const peakKey = groupKey('deepseek-account', 'deepseek-flash', 'peak');
+const fold = createLedgerApply({ tierFor: () => 'peak' });
+
+/** Drive a sequence of events through the fold. */
+function run(events, apply = fold) {
+  let state = initLedgerState();
+  for (const event of events) state = apply(state, event);
+  return state;
+}
+
+/** A complete step on one provider/model. */
+function step({ turn = 1, step: index = 1, time, provider = 'deepseek-account', model = 'deepseek-flash', usage }) {
+  return [
+    { type: 'request/header', time, data: { header: { config: { provider, model } } } },
+    { type: 'step/start', time, data: { turn, step: index } },
+    { type: 'assistant/message', time: time + 500, data: { turn, step: index, usage } },
+    { type: 'step/end', time: time + 500, data: { turn, step: index } },
+  ];
+}
+
+/** Usage reports in, billing buckets out. `null` means "not a billable report". */
+const BUCKET_CASES = [
+  ['every bucket present', { inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 },
+    { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 }],
+  ['only input, everything else absent', { inputTokens: 10 },
+    { uncachedInputTokens: 10, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+  ['an all-zero report is not a bucket set', {}, null],
+  ['no report at all', null, null],
+  // A negative count is a provider bug. Clamping it keeps the buckets that are
+  // trustworthy instead of discarding the report, so the step is still priced for
+  // what it really used.
+  ['a negative count clamps to zero and keeps its siblings', { inputTokens: -5, outputTokens: 3 },
+    { uncachedInputTokens: 0, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+  ['an all-non-positive report yields nothing', { inputTokens: -5, outputTokens: -1 }, null],
+];
+
+/** Event sequences and the state they must fold into. */
+const FOLD_CASES = [
+  {
+    name: 'one step records one row and one group',
+    events: () => step({ time: BASE, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 1000 } }),
+    want: {
+      steps: 1, turns: 0, rows: 1,
+      firstRow: { buckets: { uncachedInputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 50 }, tier: 'peak' },
+      totals: { [peakKey]: { uncachedInputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 50 } },
+    },
+  },
+  {
+    name: 'steps accumulate into one group under the same model',
+    events: () => {
+      const base = BASE;
+      return [
+        { type: 'turn/start', time: base, data: { turn: 1 } },
+        ...step({ time: base, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 1000 } }),
+        ...step({ step: 2, time: base + 1000, usage: { inputTokens: 200, outputTokens: 60, cacheReadTokens: 2000 } }),
+      ];
+    },
+    want: {
+      steps: 2, turns: 1, rows: 2,
+      totals: { [peakKey]: { uncachedInputTokens: 300, cacheReadTokens: 3000, cacheWriteTokens: 0, outputTokens: 110 } },
+    },
+  },
+  {
+    name: 'a switched model keeps its own group, so it cannot be mispriced',
+    events: () => [
+      ...step({ time: BASE, model: 'deepseek-flash', usage: { inputTokens: 10, outputTokens: 1 } }),
+      ...step({ step: 2, time: BASE + 1000, model: 'deepseek-v4-pro', usage: { inputTokens: 20, outputTokens: 2 } }),
+    ],
+    want: {
+      steps: 2, rows: 2,
+      models: ['deepseek-flash', 'deepseek-v4-pro'],
+      groupKeys: [groupKey('deepseek-account', 'deepseek-flash', 'peak'), groupKey('deepseek-account', 'deepseek-v4-pro', 'peak')],
+    },
+  },
+  {
+    name: 'an in-step retry overwrites instead of double counting',
+    events: () => [
+      { type: 'request/header', time: BASE, data: { header: { config: { provider: 'deepseek-account', model: 'deepseek-flash' } } } },
+      { type: 'step/start', time: BASE, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', time: BASE + 100, data: { usage: { inputTokens: 999, outputTokens: 999 } } },
+      { type: 'assistant/message', time: BASE + 200, data: { usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 30 } } },
+      { type: 'step/end', time: BASE + 200, data: { turn: 1, step: 1 } },
+    ],
+    want: {
+      steps: 1, rows: 1,
+      totals: { [peakKey]: { uncachedInputTokens: 10, cacheReadTokens: 30, cacheWriteTokens: 0, outputTokens: 20 } },
+    },
+  },
+  {
+    name: 'a step with no usage records a row but adds no money',
+    events: () => [
+      { type: 'request/header', time: BASE, data: { header: { config: { provider: 'deepseek-account', model: 'deepseek-flash' } } } },
+      { type: 'step/start', time: BASE, data: { turn: 1, step: 1 } },
+      { type: 'step/end', time: BASE + 100, data: { turn: 1, step: 1 } },
+    ],
+    want: { steps: 1, rows: 1, firstRow: { buckets: null }, totals: {} },
+  },
+  {
+    name: 'the tier comes from the injected resolver, so a calendar change is visible',
+    events: () => step({ time: BASE, usage: { inputTokens: 1, outputTokens: 1 } }),
+    apply: createLedgerApply({ tierFor: () => 'off-peak' }),
+    want: { steps: 1, rows: 1, firstRow: { tier: 'off-peak' }, groupSuffix: 'off-peak' },
+  },
+  {
+    name: 'an unknown provider still records, so the client can report it unpriced',
+    events: () => step({ time: BASE, provider: 'session-title-first-prompt-llm', model: 'x', usage: { inputTokens: 5, outputTokens: 1 } }),
+    want: { steps: 1, rows: 1, firstRow: { provider: 'session-title-first-prompt-llm' }, groupCount: 1 },
+  },
+  {
+    name: 'a long session trims rows but never loses money',
+    events: () => {
+      const events = [];
+      for (let index = 1; index <= 260; index += 1) {
+        events.push(...step({ step: index, time: BASE + index * 1000, usage: { inputTokens: 1, outputTokens: 1 } }));
+      }
+      return events;
+    },
+    want: {
+      steps: 260, rows: 200,
+      totals: { [peakKey]: { uncachedInputTokens: 260, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 260 } },
+      lastRowStep: 260,
+    },
+  },
+  {
+    name: 'trimming drops the oldest rows and keeps the rest in order',
+    events: () => {
+      const events = [];
+      for (let index = 1; index <= 205; index += 1) {
+        events.push(...step({ step: index, time: BASE + index * 1000, usage: { inputTokens: 1, outputTokens: 1 } }));
+      }
+      return events;
+    },
+    want: { steps: 205, rows: 200, ordered: true, firstRowStep: 6 },
+  },
+];
+
+test('buckets: a usage report normalizes into the four billing buckets', () => {
+  for (const [name, usage, want] of BUCKET_CASES) {
+    assert.deepEqual(bucketsFrom(usage), want, name);
+  }
+});
+
+test('fold: every event sequence folds into the expected rows and totals', () => {
+  for (const { name, events, apply = fold, want } of FOLD_CASES) {
+    const state = run(events(), apply);
+    if (want.steps !== undefined) assert.equal(state.steps, want.steps, `${name}: steps`);
+    if (want.turns !== undefined) assert.equal(state.turns, want.turns, `${name}: turns`);
+    if (want.rows !== undefined) assert.equal(state.rows.length, want.rows, `${name}: rows`);
+    if (want.firstRow) {
+      for (const [key, value] of Object.entries(want.firstRow)) {
+        assert.deepEqual(state.rows[0][key], value, `${name}: first row ${key}`);
+      }
+    }
+    if (want.lastRowStep !== undefined) assert.equal(state.rows[state.rows.length - 1].step, want.lastRowStep, `${name}: newest row survives`);
+    if (want.firstRowStep !== undefined) assert.equal(state.rows[0].step, want.firstRowStep, `${name}: oldest rows dropped`);
+    if (want.models) assert.deepEqual(state.rows.map((row) => row.model), want.models, `${name}: models in order`);
+    if (want.groupCount !== undefined) assert.equal(Object.keys(state.totals).length, want.groupCount, `${name}: groups`);
+    if (want.groupKeys) {
+      for (const key of want.groupKeys) assert.ok(Object.keys(state.totals).includes(key), `${name}: group ${key}`);
+    }
+    if (want.groupSuffix) {
+      assert.ok(Object.keys(state.totals)[0].endsWith(want.groupSuffix), `${name}: group carries the tier`);
+    }
+    if (want.ordered) {
+      const steps = state.rows.map((row) => row.step);
+      assert.deepEqual(steps, steps.slice().sort((a, b) => a - b), `${name}: trimming must not reorder`);
+    }
+    if (want.totals) assert.deepEqual(state.totals, want.totals, `${name}: totals`);
+  }
+});
+
+test('wire: the projected view is JSON-safe and schema-valid', () => {
+  const state = run([
+    ...step({ time: BASE, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 1000 } }),
+    ...step({ step: 2, time: BASE + 1000, usage: { inputTokens: 200, outputTokens: 60 } }),
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(state)), state, 'state must survive a JSON round trip unchanged');
+  const view = {
+    version: 1,
+    settings: {
+      version: 1,
+      display: { currency: 'USD', cnyInDetailsFor: [], usdToCny: 7.1, labels: ['cost'], details: ['cost'], primaryProvider: null },
+      budget: { sessionUsd: null, warnAt: 0.75 },
+      pricingAsOf: null,
+      providers: [],
+      problems: [],
+    },
+    ledger: toLedgerView(state),
+  };
+  assert.doesNotThrow(() => sessionMetricsWireSchema.parse(JSON.parse(JSON.stringify(view))));
+});
+
+test('wire: a view with an unexpected field or a bad row is rejected', () => {
+  const valid = {
+    version: 1,
+    settings: {
+      version: 1,
+      display: { currency: 'USD', cnyInDetailsFor: [], usdToCny: 7.1, labels: [], details: [], primaryProvider: null },
+      budget: { sessionUsd: null, warnAt: 0.75 },
+      pricingAsOf: null,
+      providers: [],
+      problems: [],
+    },
+    ledger: { turns: 0, steps: 0, totals: {}, rows: [] },
+  };
+  assert.doesNotThrow(() => sessionMetricsWireSchema.parse(valid), 'the control view is valid');
+  assert.throws(() => sessionMetricsWireSchema.parse({ ...valid, surprise: true }), /is not a known field/);
+  assert.throws(() => sessionMetricsWireSchema.parse({ ...valid, ledger: { ...valid.ledger, rows: [{ turn: 'x' }] } }), /must be a number/);
+});

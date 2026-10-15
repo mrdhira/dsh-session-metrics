@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "paths": {}
+  },
+  "include": [
+    "src/host/money.ts",
+    "src/host/pricing.ts",
+    "src/host/ledger.ts",
+    "src/host/settings.ts",
+    "src/host/index.ts",
+    "src/host/schema.ts"
+  ]
+}

@@ -1,0 +1,22 @@
+# The session-metrics bundle's one Loader row.
+#
+# `config` is present but empty on purpose. Cordis validates a row's config
+# *before* the plugin activates and passes `undefined` when the key is absent,
+# which a schema without a root default rejects as "<root> is required". Keeping
+# an explicit empty object means the row activates with every schema default.
+# Rate cards for deepseek-account, deepseek-official and netra-runtime ship as
+# defaults, so nothing needs to be listed here. Add fields only to override:
+#
+#   config:
+#     budget: { sessionUsd: 5 }
+#     display: { currency: USD, primaryProvider: deepseek-account }
+#     providers:
+#       - id: my-router
+#         models:
+#           - model: some/model
+#             rates: { flat: { cacheHit: 0.01, cacheMiss: 0.1, output: 0.25 } }
+#         billing: { windows: [] }     # no peak concept
+- insert:
+    - id: session-metrics
+      name: dsh-session-metrics
+      config: {}

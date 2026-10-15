@@ -1,0 +1,379 @@
+/**
+ * Client bundle tests under jsdom.
+ *
+ * The bundle is a plain-JS `window.__ModuleLoader__.load({...})` script, so the
+ * test evaluates the real file through a stub loader rather than importing it —
+ * the same path the browser takes. Two things are checked that the host tests
+ * cannot see: that the strip renders the money/tier/provider facts, and that it
+ * renders **none** of the figures the shipped stats pills already own.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { resolveSettings } from '../lib/v1/settings.js';
+import { loadBundle, mount } from './harness.js';
+import { priceBuckets, ratesAt, findCard } from '../lib/v1/pricing.js';
+import { formatUsd } from '../lib/v1/money.js';
+
+
+
+/** Mount the strip with fixed projection values. */
+function render(args) {
+  const { ledger, settings, selection, usage, projectionMissing = false } = args;
+  // `hasOwnProperty` rather than a default parameter: a test that passes
+  // `sessionId: undefined` on purpose must reach the component as undefined, or the
+  // default silently substitutes a real session and the test asserts the wrong thing.
+  const sessionId = Object.prototype.hasOwnProperty.call(args, 'sessionId') ? args.sessionId : 'session-test';
+  const loaded = loadBundle();
+  const registration = loaded.slot('conversation.input.dock');
+  const useProjection = (key) => {
+    if (key === 'sessionMetrics') return projectionMissing ? undefined : { version: 1, settings, ledger };
+    if (key === 'tokenUsage') return usage;
+    if (key === 'modelSelection') return selection;
+    return undefined;
+  };
+  const view = mount(loaded, registration, { sessionId, useProjection });
+  return {
+    ...view,
+    clickTrigger: () => view.click('.dsm-trigger'),
+  };
+}
+
+const settings = resolveSettings({ display: { primaryProvider: 'deepseek-account' } });
+
+/** One $1.0944 peak step on the shipped DeepSeek card. */
+const ledger = {
+  turns: 1,
+  steps: 1,
+  totals: {
+    'deepseek-account\u0000deepseek-flash\u0000peak': {
+      uncachedInputTokens: 377,
+      cacheReadTokens: 375_040,
+      cacheWriteTokens: 0,
+      outputTokens: 910,
+    },
+  },
+  rows: [{
+    turn: 1, step: 1, startTime: Date.now() - 1000, endTime: Date.now(),
+    provider: 'deepseek-account', model: 'deepseek-flash', tier: 'peak',
+    buckets: { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 },
+  }],
+};
+
+const selection = { lastUsed: { provider: 'deepseek-account', model: 'deepseek-flash' } };
+const usage = { uncachedInputTokens: 377, cacheReadTokens: 375_040, cacheWriteTokens: 0, outputTokens: 910 };
+
+test('registration: the strip passes only the options its slot declares', () => {
+  // `conversation.input.dock` declares `id`, `order`, `label` and nothing else. An
+  // `inject` here is unsupported, and where a slot does support it the return value
+  // becomes the component's props — which silently replaced `useProjection` and
+  // `sessionId` and left the strip with nothing to read.
+  const loaded = loadBundle();
+  const spec = loaded.slot('conversation.input.dock').spec;
+  assert.equal(spec.inject, undefined, 'no inject option on this slot');
+  assert.equal(spec.id, 'dsh-session-metrics');
+  assert.equal(spec.order, 17, 'the order doubles as the loaded-generation marker');
+  assert.equal(String(Object.keys(spec).sort()), 'id,name,order');
+});
+
+test('labels: the strip shows peak state, the clock, cost, savings and provider without a click', () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    const text = view.text();
+    // The expectation comes from the host module rather than from mental arithmetic:
+    // 910 output tokens at $1.20/1M plus the cached and uncached prompt is a third of a
+    // cent, so this fixture also pins the sub-cent display.
+    const card = findCard(settings.providers, 'deepseek-account', 'deepseek-flash');
+    const expected = priceBuckets(ratesAt(card.model, 'peak'), ledger.rows[0].buckets).totalNano;
+    assert.equal(formatUsd(expected, 4), '0.0034', 'the fixture prices to a third of a cent');
+    assert.match(text, /< \$0\.01/, `a session that cost something must not read as free: ${text}`);
+    assert.match(text, /Cost/);
+    assert.match(text, /Saved/);
+    assert.match(text, /\$0\.11/, 'cache savings at two decimals');
+    assert.match(text, /(ON|OFF) PEAK HOURS/, 'the tier is legible without clicking');
+    assert.match(text, /\d\d:\d\d/, 'a 24-hour clock');
+    const zone = (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC').split('/').pop();
+    assert.equal(text.includes(zone), true, `the clock names the viewer zone: ${text}`);
+    const trigger = view.container.querySelector('.dsm-trigger');
+    assert.ok(trigger !== null);
+    assert.equal(trigger.textContent.includes('deepseek-flash'), false, 'no model chip in the strip');
+    assert.equal(trigger.textContent.includes('session-metrics/v'), false, 'no build tag in the strip');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('labels: a dot separates every pair of chips', () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    const separators = view.container.querySelectorAll('.dsm-sep');
+    const chips = view.container.querySelectorAll('.dsm-trigger > .dsm-item, .dsm-trigger > .dsm-model');
+    assert.equal(chips.length >= 3, true, `expected several chips, found ${chips.length}`);
+    assert.equal(separators.length, chips.length - 1, 'one divider between each pair, and none at the ends');
+    for (const node of separators) assert.equal(node.textContent, '\u00b7', 'the divider is a middot');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('labels: peak is an up triangle and off-peak a down triangle, in the app colours', () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    const peak = view.container.querySelector('.dsm-peak');
+    const off = view.container.querySelector('.dsm-off');
+    assert.equal(peak === null && off === null, false, 'the tier chip is present at any hour');
+    if (peak !== null) {
+      assert.equal(peak.textContent.includes('\u25b2'), true, 'peak points up');
+      assert.equal(peak.textContent.includes('ON'), true, 'peak reads ON');
+    }
+    if (off !== null) {
+      assert.equal(off.textContent.includes('\u25bc'), true, 'off-peak points down');
+      assert.equal(off.textContent.includes('OFF'), true, 'off-peak reads OFF');
+    }
+    const css = [...view.container.ownerDocument.querySelectorAll('style[data-plugin-css]')]
+      .map((node) => node.textContent).join('');
+    assert.match(css, /\.dsm-peak\{color:var\(--dsw-alias-state-error-primary/, 'peak uses the error colour');
+    assert.match(css, /\.dsm-off\{color:var\(--dsw-alias-state-success-primary/, 'off-peak uses the success colour');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('labels: the provider chip shows unless the config names it as primary', () => {
+  const shown = render({ ledger, settings: resolveSettings({}), selection, usage });
+  try {
+    assert.match(shown.text(), /deepseek-account/, 'the provider chip');
+  } finally {
+    shown.unmount();
+  }
+  const hidden = render({ ledger, settings, selection, usage });
+  try {
+    assert.equal(hidden.container.querySelector('.dsm-trigger').textContent.includes('deepseek-account'), false,
+      'primaryProvider suppresses the chip');
+  } finally {
+    hidden.unmount();
+  }
+});
+
+test('labels: a legacy window/savings config still renders the peak flag, the clock and savings', () => {
+  const legacy = resolveSettings({ display: { labels: ['cost', 'savings', 'window'] } });
+  const view = render({ ledger, settings: legacy, selection, usage });
+  try {
+    const text = view.text();
+    assert.match(text, /Cost/);
+    assert.match(text, /Saved/);
+    assert.match(text, /(ON|OFF) PEAK HOURS/, 'window expands to the peak flag plus the clock');
+    assert.match(text, /\d\d:\d\d/, 'and the clock');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('details: four sections, no step table, and the pill figures stay out of it', async () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    await view.clickTrigger();
+    const text = view.text();
+    for (const heading of ['Cost breakdown', 'Saving breakdown', 'Model provider', 'Timezone']) {
+      assert.match(text, new RegExp(heading), `missing section: ${heading}`);
+    }
+    assert.match(text, /Input/);
+    assert.match(text, /Output/);
+    assert.match(text, /Cached/);
+    assert.equal(text.includes('Cost by step'), false, 'the per-step table is gone');
+    assert.equal(text.includes('Cache savings'), false, 'renamed to Saving breakdown');
+    assert.equal(text.includes('Rate window'), false, 'renamed to Timezone');
+    assert.equal(text.includes('Sources'), false, 'the sources section is gone');
+    assert.equal(text.includes('Rates as of'), false, 'rates-as-of was dropped');
+    // build id and provenance moved onto the heading, reachable on hover
+    const heading = view.container.querySelector('.dsm-title span');
+    const headingTitle = heading === null ? '' : heading.getAttribute('title') || '';
+    assert.match(headingTitle, /build dsh-session-metrics\//, `the heading identifies the loaded generation: ${headingTitle}`);
+    assert.match(headingTitle, /tokenUsage/, 'and still names the projection the tokens come from');
+    for (const forbidden of ['tok/s', 'AVG TTFT', 'Context Used', 'System Prompt', 'Tool Definitions', '% Context']) {
+      assert.equal(text.includes(forbidden), false, `"${forbidden}" is a stats-pill figure: ${text}`);
+    }
+  } finally {
+    view.unmount();
+  }
+});
+
+test('details: a metric explanation floats above the panel, clamped to the viewport', async () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    await view.clickTrigger();
+    const hints = [...view.container.querySelectorAll('.dsm-hint')];
+    assert.ok(hints.length >= 3, `expected the Saved/Blended/share hints, found ${hints.length}`);
+    for (const hint of hints) {
+      assert.equal((hint.getAttribute('aria-label') || '').length > 20, true, 'named for assistive technology');
+    }
+    // The box is portalled, so it lives in the document rather than in the slot subtree.
+    const findBox = () => view.container.ownerDocument.querySelector('.dsm-tipBox');
+    assert.equal(findBox() === null, true, 'nothing floats until hovered');
+
+    await view.hover(hints[0]);
+    const box = findBox();
+    assert.ok(box !== null, 'hovering reveals the explanation');
+    assert.equal(box.getAttribute('role'), 'tooltip');
+    // Portalled to the body: no scroll container or transformed ancestor can clip it.
+    assert.equal(box.parentElement === view.container.ownerDocument.body, true,
+      `the explanation must escape the panel: ${box.parentElement && box.parentElement.className}`);
+    assert.equal(box.textContent.length > 20, true, `thin explanation: ${box.textContent}`);
+    const style = box.getAttribute('style') || '';
+    assert.match(style, /left: \d+px/, 'positioned in viewport coordinates');
+    // Clamped, so a right-hand column cannot push the box off screen or under the panel edge.
+    assert.match(style, /left: (1[2-9]|[2-9]\d|\d{3,})px/, `clamped from the left edge: ${style}`);
+    const css = [...view.container.ownerDocument.querySelectorAll('style[data-plugin-css]')]
+      .map((node) => node.textContent).join('');
+    assert.match(css, /\.dsm-tipBox\{position:fixed/, 'fixed, so the scrolling panel cannot clip it');
+    assert.match(css, /max-width:min\(320px,calc\(100vw - 24px\)\)/, 'hugging its text, clamped to the window');
+    assert.match(css, /pointer-events:none/, 'and it never steals the pointer');
+
+    await view.unhover(hints[0]);
+    assert.equal(findBox() === null, true, 'and it goes away');
+
+    // The reported bug: a label near the right edge pushed the box past the window and it
+    // was cropped. A clamped left coordinate keeps the whole box on screen.
+    const win = view.container.ownerDocument.defaultView;
+    const farRight = hints[0];
+    farRight.getBoundingClientRect = () => ({ left: win.innerWidth - 20, right: win.innerWidth, top: 300, bottom: 316, width: 20, height: 16 });
+    await view.hover(farRight);
+    const clamped = findBox();
+    assert.ok(clamped !== null, 'the explanation opens for a right-edge label');
+    const left = Number(((clamped.getAttribute('style') || '').match(/left: (\d+)px/) || [])[1]);
+    assert.equal(left + 320 <= win.innerWidth, true, `the box must fit: left ${left} in ${win.innerWidth}`);
+    assert.equal(clamped.className.includes('dsm-tipAbove'), true, 'and it opens upward when there is room');
+    await view.unhover(farRight);
+    assert.equal(findBox() === null, true, 'and clears again');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('details: the model provider table names the peak-hour state per row', async () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    await view.clickTrigger();
+    const rows = [...view.container.querySelectorAll('.dsm-table tbody tr')];
+    assert.ok(rows.length >= 1, 'a row per provider/model group');
+    assert.equal(rows.length, 1, 'a model that ran both tiers is ONE row, not two');
+    const cells = [...rows[0].querySelectorAll('td')].map((node) => node.textContent);
+    assert.equal(cells.length, 3, 'provider, model, peak hours');
+    assert.equal(cells[0], 'deepseek-account');
+    assert.equal(cells[1], 'DeepSeek V4.1 Flash', `the card's own label, not the internal key: ${cells[1]}`);
+    assert.equal(['On', 'Off', 'None'].includes(cells[2]), true, `peak hours cell: ${cells[2]}`);
+  } finally {
+    view.unmount();
+  }
+});
+
+test('details: the timezone section reports both clocks, one local sentence, no countdown note', async () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    await view.clickTrigger();
+    const text = view.text();
+    assert.match(text, /Local time/, 'the reader\u2019s clock');
+    assert.match(text, /Provider time/, 'the billing clock');
+    assert.match(text, /UTC/);
+    // Only the reader's zone: the provider's clock was noise once the windows are translated.
+    assert.match(text, /Peak hours run on weekdays 10:00\u201313:00 and 15:00\u201319:00 Asia\/Tokyo/, `schedule sentence: ${text}`);
+    assert.equal(/01:00\u201304:00/.test(text), false, 'the provider-zone window list is gone');
+    assert.match(text, /Ongoing|Next in|None/, 'a short peak state');
+    assert.equal(/starts in .* \u2014 at /.test(text), false, 'and no redundant countdown note');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('placement: sticky like the composer, with no shipped stylesheet override', () => {
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    const css = view.styles();
+    assert.match(css, /\.dsm-slot\{position:sticky;bottom:0/, 'the strip pins itself the way the composer seat does');
+    assert.doesNotMatch(css, /\.dsm-slot\{[^}]*position:fixed/, 'viewport pinning scrolls wrong and stays banned');
+    assert.equal(css.includes('.InputBar_dock'), false, 'the shipped composer dock row must not be restyled');
+    // Typography must follow the app's own font-size setting (ui-theme.fontSize) rather
+    // than pinning pixels, or the widget cannot scale with it.
+    assert.match(css, /font-size:calc\(var\(--dsh-content-font-size,14px\)/, 'sized from the app variable');
+    assert.equal(/font-size:\d+px/.test(css), false, 'no hardcoded pixel sizes');
+    assert.equal(view.container.querySelector('.dsm-slot').getAttribute('data-safe'), 'true');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: the model is derived from the ledger when modelSelection is absent', async () => {
+  // The ledger records the provider and model of every step, so the strip must not
+  // depend on a second projection to have anything to show.
+  const view = render({ ledger, settings, selection: null, usage });
+  try {
+    const text = view.text();
+    assert.match(text, /Cost< \$0\.01|Cost\$/, `expected the strip to price the session from the ledger: ${text}`);
+    // The model chip is gone from the strip, so the proof that the ledger resolved the
+    // model is that the step priced against that model's own card: $0.11 of cache savings.
+    assert.match(text, /Saved\$0\.11/, `expected the ledger's model to price the step: ${text}`);
+    await view.clickTrigger();
+    const rows = [...view.container.querySelectorAll('.dsm-table tbody tr')];
+    assert.equal(rows.length, 1, 'one ledger group');
+    assert.equal(rows[0].querySelectorAll('td')[1].textContent, 'DeepSeek V4.1 Flash', 'the ledger supplied the model, resolved to its card');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: a missing projection explains itself instead of vanishing', () => {
+  const view = render({ ledger: null, settings, selection, usage });
+  try {
+    const chip = view.container.querySelector('.dsm-trigger');
+    assert.ok(chip !== null, 'a silent panel is undiagnosable; the strip must say what it waits for');
+    assert.equal(view.container.querySelector('.dsm-slot').getAttribute('data-safe'), 'false');
+    assert.match(view.text(), /waiting/);
+    assert.match(chip.getAttribute('title'), /the projection carries no ledger/, 'the reason names the absent half');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: the diagnostic names the absent sources when opened', async () => {
+  const view = render({ selection: null, usage: null, projectionMissing: true });
+  try {
+    await view.clickTrigger();
+    const text = view.text();
+    assert.match(text, /Why the strip is waiting/);
+    assert.match(text, /sessionMetrics: absent/);
+    // `null` means the projection is served but empty, which is different from
+    // absent — the diagnostic must not flatten the two.
+    assert.match(text, /tokenUsage: null/);
+    assert.match(text, /modelSelection: null/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: a missing session prop is reported, not treated as an empty session', () => {
+  // The projections are session-scoped by the framework, so a strip that renders
+  // nothing because a prop was absent is a fault, not a legitimate empty state.
+  const view = render({ ledger, settings, selection, usage, sessionId: undefined });
+  try {
+    const chip = view.container.querySelector('.dsm-trigger');
+    assert.ok(chip !== null, 'the strip must still render when data is present');
+    assert.equal(view.container.querySelector('.dsm-diag') === null, true, 'not rendered as a diagnostic when it has data');
+    assert.match(view.text(), /Cost/, 'the strip renders normally from the projections');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: no session and no data still renders a diagnostic, never nothing', () => {
+  // A silent entry is undiagnosable: the slot reports it inactive and the user sees an
+  // empty space with no clue which input is missing.
+  const view = render({ projectionMissing: true, sessionId: undefined });
+  try {
+    const chip = view.container.querySelector('.dsm-trigger');
+    assert.ok(chip !== null, 'the strip must render even with nothing to price');
+    assert.ok(view.container.querySelector('.dsm-diag') !== null, 'and it renders as a diagnostic');
+    assert.match(view.text(), /waiting/);
+  } finally {
+    view.unmount();
+  }
+});
