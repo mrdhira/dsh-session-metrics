@@ -101,7 +101,7 @@ const display = z.object({
 /** Optional per-session spend ceiling. */
 const budget = z.object({
   sessionUsd: z.number().positive().optional().describe('Omit or set null to disable'),
-  warnAt: z.number().positive().max(1).withDefault(0.75),
+  warnAt: z.number().positive().max(1).withDefault(0.75).describe('Fraction of the session budget at which the strip warns (0-1)'),
 });
 
 /**
