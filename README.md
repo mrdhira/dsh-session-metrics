@@ -64,7 +64,9 @@ host file has no effect until restart — see `docs/data-sources.md`.)
 ## Configure
 
 Rates ship for `deepseek-account`, `deepseek-official`, `netra-runtime` and
-`openrouter`, so nothing needs configuring to start. OpenRouter ships **only the
+`openrouter`, so a **fresh install** needs no configuring; a profile patch that
+lists its own `providers` replaces those shipped cards rather than adding to them
+(see the note below). OpenRouter ships **only the
 models its own catalog marks free** (the `:free` suffix, and the free-models
 router) at zero rates; its paid models deliberately have no card, because the
 profile lists no prices for them. To change a rate, either open the plugin's page

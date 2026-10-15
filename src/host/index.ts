@@ -97,7 +97,12 @@ export function apply(ctx: any, rawConfig: any) {
 
   ctx.sessionProjections.register({
     key: 'sessionMetrics',
-    stateVersion: 1,
+    // Bumped to 2 when `discovered` joined the state: the framework treats a stored
+    // row whose `ver` matches as usable and replays only its tail, so a ver-1
+    // checkpoint (every session that existed before discovery shipped) would keep
+    // the old shape and never gain the list. A mismatch discards the row and
+    // refolds from `init` over the whole log, which is what recomputes discovery.
+    stateVersion: 2,
     stateSchema: { parse: (value: any) => value },
     // Both halves stay pure: `init` builds a fresh state per session and `apply`
     // returns a new state, so no variable is shared between sessions.

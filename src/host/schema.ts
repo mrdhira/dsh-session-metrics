@@ -77,12 +77,14 @@ const buckets = z.object({
  *
  * `tokens` is the sum of the buckets attributed to the pair; it is evidence of
  * how much went unpriced, never a cost — a pair without a card has no rate.
+ * `reports` counts the usage reports banked for the pair (not steps: one step can
+ * report twice, and a replacement report counts once).
  */
 const discoveredPair = z.object({
   provider: z.union([z.string(), z.null()]),
   model: z.union([z.string(), z.null()]),
   tokens: z.number(),
-  steps: z.number(),
+  reports: z.number(),
   firstSeen: z.union([z.number(), z.null()]),
   lastSeen: z.union([z.number(), z.null()]),
 });

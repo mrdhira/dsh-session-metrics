@@ -23,7 +23,9 @@
  * screen that shows only configuration — the Pricing page cannot see sessions,
  * and a session-scoped detail view cannot see other sessions. Recording it here
  * is what lets the client say "this is what was seen, and it is unpriced"
- * instead of silently omitting it; it is deduped by pair and bounded.
+ * instead of silently omitting it; it is deduped by pair, bounded, and obeys the
+ * same replace-not-add accounting as `totals` (a retry that moves to another pair
+ * must leave nothing behind for the pair it left).
  *
  * State is plain JSON: no BigInt, no Date, no functions. A projection unit's
  * state is checkpointed, and the checkpoint row schema refuses anything
@@ -97,39 +99,50 @@ function pairKey(provider: any, model: any) {
 }
 
 /**
- * Record one billable observation of a pair with no rate card, deduped by pair.
+ * Add one report to a discovered pair, or retract a replaced one, deduped by pair.
  *
  * Tokens are summed as evidence of how much went unpriced; no money is derived
- * here, because a pair with no card has no rate to apply. The list is bounded —
- * a session that cycles through more unpriced pairs than the limit keeps the
- * first ones seen, so the earliest evidence is what survives.
- * @param state - ledger state (not mutated).
+ * here, because a pair with no card has no rate to apply. `sign` is `+1` when a
+ * report is banked and `-1` when the report it replaced is taken back, so the
+ * list mirrors the same replace-not-add accounting as `totals`: an in-step retry
+ * that switches pairs leaves no discovery row for the pair it abandoned. The list
+ * is bounded — a session that cycles through more unpriced pairs than the limit
+ * keeps the first ones seen, so the earliest evidence is what survives — while an
+ * entry already on the list keeps updating past the bound.
+ * @param discovered - the discovery map (not mutated).
  * @param provider - provider id from the request header.
  * @param model - model id from the request header.
- * @param at - the instant of the report.
+ * @param at - the instant of the report; ignored when retracting.
  * @param buckets - the buckets that were attributed to the pair.
- * @returns the new state.
+ * @param sign - `+1` to bank one report, `-1` to retract one.
+ * @returns the new discovery map.
  */
-function noteDiscovered(state: any, provider: any, model: any, at: any, buckets: any) {
-  const discovered = state.discovered ?? {};
+function foldDiscovered(discovered: any, provider: any, model: any, at: any, buckets: any, sign: number) {
   const key = pairKey(provider, model);
   const current = discovered[key];
-  if (current === undefined && Object.keys(discovered).length >= DISCOVERY_LIMIT) return state;
-  const entry = current ?? { provider: provider ?? null, model: model ?? null, tokens: 0, steps: 0, firstSeen: at ?? null, lastSeen: at ?? null };
-  return {
-    ...state,
-    discovered: {
-      ...discovered,
-      [key]: {
-        provider: entry.provider,
-        model: entry.model,
-        tokens: entry.tokens + bucketTotal(buckets),
-        steps: entry.steps + 1,
-        firstSeen: entry.firstSeen,
-        lastSeen: at ?? null,
-      },
-    },
+  if (current === undefined) {
+    // Retracting a pair that was never recorded (it had a card) is a no-op; a new
+    // pair past the bound is dropped rather than displacing the earliest evidence.
+    if (sign < 0 || Object.keys(discovered).length >= DISCOVERY_LIMIT) return discovered;
+  }
+  const entry = current ?? { provider: provider ?? null, model: model ?? null, tokens: 0, reports: 0, firstSeen: at ?? null, lastSeen: at ?? null };
+  const reports = entry.reports + sign;
+  const next = { ...discovered };
+  if (reports <= 0) {
+    // The last report for the pair was retracted, so the pair does not exist — the
+    // same rule that drops an emptied group from `totals`.
+    delete next[key];
+    return next;
+  }
+  next[key] = {
+    provider: entry.provider,
+    model: entry.model,
+    tokens: entry.tokens + sign * bucketTotal(buckets),
+    reports,
+    firstSeen: entry.firstSeen,
+    lastSeen: sign > 0 ? (at ?? null) : entry.lastSeen,
   };
+  return next;
 }
 
 /**
@@ -264,6 +277,9 @@ export function createLedgerApply(options: any) {
       const key = groupKey(provider, model, tierAtReport);
 
       let totals = state.totals;
+      // The `?? {}` keeps a pre-`discovered` checkpoint foldable: the field simply
+      // was not there, and a missing field is an empty list, never a crash.
+      let discovered = state.discovered ?? {};
       let rows = state.rows;
       let openIndex = state.openIndex;
       if (row === null || row === undefined) {
@@ -283,17 +299,25 @@ export function createLedgerApply(options: any) {
         rows = appendRow(rows, synthetic);
         openIndex = rows.length - 1;
       } else {
-        if (row.groupKey !== null && row.buckets !== null) totals = subtractFromTotals(totals, row.groupKey, row.buckets);
+        if (row.groupKey !== null && row.buckets !== null) {
+          totals = subtractFromTotals(totals, row.groupKey, row.buckets);
+          // `discovered` mirrors `totals`: the report being replaced is retracted
+          // before the new one is banked, or an in-step retry would leave a pair
+          // listed with tokens no group carries.
+          if (!hasCard(row.provider, row.model)) {
+            discovered = foldDiscovered(discovered, row.provider, row.model, null, row.buckets, -1);
+          }
+        }
         rows = rows.slice();
         rows[openIndex] = { ...row, endTime: at, provider, model, tier: tierAtReport, buckets, groupKey: key };
       }
       totals = addToTotals(totals, key, buckets);
-      const next = { ...state, rows, totals, openIndex };
       // Discovery is recorded where usage is attributed, not at `step/start`: a
       // header alone is a request that may never have been billed, while a
       // reported bucket set is money that was really spent (and, with no card,
       // really cannot be priced).
-      return hasCard(provider, model) ? next : noteDiscovered(next, provider, model, at, buckets);
+      if (!hasCard(provider, model)) discovered = foldDiscovered(discovered, provider, model, at, buckets, 1);
+      return { ...state, rows, totals, openIndex, discovered };
     }
 
     if (type === 'step/end' || type === 'turn/end') {
@@ -324,7 +348,7 @@ function discoveredView(state: any) {
       provider: entry.provider ?? null,
       model: entry.model ?? null,
       tokens: entry.tokens,
-      steps: entry.steps,
+      reports: entry.reports,
       firstSeen: entry.firstSeen ?? null,
       lastSeen: entry.lastSeen ?? null,
     }))

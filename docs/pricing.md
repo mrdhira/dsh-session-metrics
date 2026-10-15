@@ -67,9 +67,13 @@ data. So the host ledger keeps a second, small list.
 - **Recorded where usage is attributed**, not at `request/header`: a header is a
   request that may never be billed, while a reported bucket set is spend that
   really happened and really cannot be priced.
+- **Netted on replace, exactly like `totals`**: an in-step retry subtracts the
+  report it replaces before banking the new one (and drops the pair when that was
+  its last report), so the list never names a pair whose tokens no longer count.
 - **Deduped by pair** and **bounded** (32 pairs): each row carries the pair, the
-  total tokens seen, the number of reports, and the first/last instants. The first
-  pairs observed are the ones kept when the bound is reached.
+  total tokens seen, the number of reports (`reports`, not steps — one step can
+  report twice and a replacement report counts once), and the first/last instants.
+  The first pairs observed are the ones kept when the bound is reached.
 - **Exposed on the existing projection** as `ledger.discovered` — same
   `sessionMetrics` channel, no new service and no change to any existing config
   field. The wire schema carries it, so a malformed row is refused at the
@@ -98,6 +102,11 @@ reads `unpriced` and appears under *Seen, unpriced*.
 | `netra-runtime` | `deepseek/deepseek-v4-flash-0731` | 0.01 | 0.10 | 0.25 | flat |
 | `openrouter` | the 19 `:free` catalog models, plus `free` (`openrouter/free`) | 0 | 0 | 0 | flat |
 
+These are the **defaults for a fresh install**: a non-empty `providers` list in the profile's
+`cordis.patch.yml` *replaces* this whole table rather than adding to it, so on this machine — where
+the patch pins `openrouter` to two cards — only `nvidia/nemotron-3.5-lightning:free` and `free` are
+carded and the other 17 `:free` catalog ids read `unpriced`.
+
 ### Why OpenRouter ships only free cards
 
 The profile's `llm-pi-ai` catalog lists ~200 OpenRouter models with `id`, `name`,
@@ -105,7 +114,8 @@ The profile's `llm-pi-ai` catalog lists ~200 OpenRouter models with `id`, `name`
 carries is the provider's own free designation: the `:free` id suffix and the
 `"(free)"` display name. Those 19 models (for example
 `nvidia/nemotron-3.5-lightning:free`, the model `agent-default-model` configures)
-ship a zero card, so a session on one prices to exactly `$0.00`.
+ship a zero card while this table is the effective one (see the replacement rule above), so a
+session on one prices to exactly `$0.00`.
 
 The paid models deliberately ship no card. Their rates are not in the profile,
 and a guessed number would be a fabricated bill; instead a session that used one
