@@ -125,11 +125,11 @@ This plugin is the reference layout: `src/**` is the source of truth, `lib/**` i
 by `npm run build`, and the tests import the **built** files so a green suite means the
 shipped bytes work. `src/client/index.cts` is CommonJS on purpose — the loader's factory
 returns `module.exports`, and `.cts` keeps esbuild from treating it as ESM under
-`"type": "module"`. `npm run typecheck` runs two projects: `tsconfig.json` is `strict` for
-the domain modules, `tsconfig.dynamic.json` covers the browser half and the dynamic schema
-shim (`src/host/zod.ts`, `@ts-nocheck` with its compensating tests named in the file).
-The packaged app ships no `.d.ts`, so `types/dsh.d.ts` declares the surfaces this plugin
-actually uses.
+`"type": "module"`. `npm run typecheck` runs **three** projects: `tsconfig.json` is `strict` for the
+domain modules, `tsconfig.dynamic.json` is `strict` for the browser half (whose DSH seams are declared in
+`types/dsh.d.ts` — the packaged app ships no `.d.ts`), and `tsconfig.test.json` covers the TypeScript
+tests. The dynamic schema shim (`src/host/zod.ts`) is the single `@ts-nocheck`, with its compensating
+tests named in the file.
 
 ## History: TypeScript is the norm, via a build step
 
@@ -210,7 +210,8 @@ Two consequences worth remembering:
 - `test/client.dom.test.ts`, `test/pricing-page.dom.test.ts` — the two client surfaces under
   jsdom through a stub loader that mirrors the restricted context.
 
-Typing is deliberate and uneven: the host domain modules are `strict`, while the dynamic
-schema shim (`src/host/zod.ts`) is `@ts-nocheck` and the browser half is checked without
-implicit-any gates — DSH publishes no client-slot prop types. The tests are JavaScript on
-purpose: they must exercise the built artifacts, and they assert on primitives.
+Typing is uniform now: the host domain modules, the browser half and the tests are all `strict`. The
+browser half types its DSH seams through vendored declarations in `types/dsh.d.ts`, written from observed
+contracts, with the two genuinely unknown boundaries typed `unknown` and narrowed explicitly — no `any`.
+The tests are TypeScript: they exercise the built artifacts, assert on primitives, and are type-checked
+against them.
