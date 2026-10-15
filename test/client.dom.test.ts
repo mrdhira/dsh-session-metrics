@@ -161,6 +161,38 @@ const mixedLedger: LedgerFixture = {
   discovered: [discoveredPair],
 };
 
+/**
+ * A resolved settings fixture whose one card has **only** a flat rate row.
+ *
+ * Deliberately *not* built by `resolveSettings`: the Host's own resolver always emits
+ * `rates.peak` (null when the mode is flat), so it cannot express the shape that crashed
+ * the live page — a stored card read as resolved, where `rates.peak` is `undefined`
+ * rather than null and `.cacheHit` off it throws. The client must survive a card that is
+ * missing a tier's row entirely, so the fixture reproduces that shape literally.
+ * @param rates - the rate rows the card carries, in nanodollars per 1M.
+ * @returns a settings object shaped like the `sessionMetrics` projection's `settings`.
+ */
+function flatOnly(rates: { flat?: Record<string, number>; peak?: Record<string, number> }): SettingsFixture {
+  return {
+    version: 1,
+    display: {
+      currency: 'USD', cnyInDetailsFor: [], usdToCny: 7.1,
+      labels: ['peak', 'time', 'cost', 'saved', 'provider'],
+      details: ['cost', 'savings', 'models', 'window'],
+      primaryProvider: null,
+    },
+    budget: { sessionUsd: null, warnAt: 0.75 },
+    pricingAsOf: null,
+    problems: [],
+    providers: [{
+      id: 'flat-only',
+      label: 'Flat Only',
+      billing: { timezone: 'UTC', weekdays: [1, 2, 3, 4, 5], windows: [], holidays: [], holidayZone: 'Asia/Shanghai' },
+      models: [{ model: 'flat-only-1', aliases: [], mode: 'flat', rates: rates }],
+    }],
+  };
+}
+
 test('registration: the strip passes only the options its slot declares', () => {
   // `conversation.input.dock` declares `id`, `order`, `label` and nothing else. An
   // `inject` here is unsupported, and where a slot does support it the return value
@@ -529,6 +561,86 @@ test('robustness: no session and no data still renders a diagnostic, never nothi
     assert.ok(chip !== null, 'the strip must render even with nothing to price');
     assert.ok(view.container.querySelector('.dsm-diag') !== null, 'and it renders as a diagnostic');
     assert.match(view.text(), /waiting/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: a card with a flat row only, read at a peak tier, is unpriced rather than a crash', () => {
+  // Live crash: `rates.peak` is undefined on a flat model, and the rate fields then read
+  // `.cacheHit` off undefined. The ledger's stored tier is what selects the row, so a
+  // flat card that recorded a peak tier is the exact shape that threw.
+  const settings = flatOnly({ flat: { cacheHit: 10_000_000, cacheMiss: 100_000_000, cacheWrite: 100_000_000, output: 250_000_000 } });
+  const view = render({ ledger, settings, selection, usage });
+  try {
+    const text = view.text();
+    assert.equal(text.includes('session-metrics failed'), false, `must not crash: ${text.slice(0, 140)}`);
+    assert.match(text, /unpriced/, 'a tier the card does not carry is unpriced, never invented');
+    assert.equal(text.includes('NaN'), false, 'and nothing is rendered as NaN');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: a flat card is priced for real when the ledger records the flat tier', () => {
+  // The positive half of the row above: the guard must not make every flat card unpriced.
+  const settings = flatOnly({ flat: { cacheHit: 10_000_000, cacheMiss: 100_000_000, cacheWrite: 100_000_000, output: 250_000_000 } });
+  const oneCent = { uncachedInputTokens: 60_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 16_000 };
+  const flatLedger: LedgerFixture = {
+    turns: 1, steps: 1,
+    totals: { 'flat-only\u0000flat-only-1\u0000flat': oneCent },
+    rows: [{
+      turn: 1, step: 1, startTime: Date.now() - 1000, endTime: Date.now(),
+      provider: 'flat-only', model: 'flat-only-1', tier: 'flat', buckets: oneCent,
+    }],
+  };
+  const view = render({ ledger: flatLedger, settings, selection: { lastUsed: { provider: 'flat-only', model: 'flat-only-1' } }, usage: oneCent });
+  try {
+    const text = view.text();
+    assert.equal(text.includes('session-metrics failed'), false, `must not crash: ${text.slice(0, 140)}`);
+    assert.equal(text.includes('unpriced'), false, 'a card with a flat row is priced');
+    assert.match(text, /Cost/, 'the cost chip is present');
+  } finally {
+    view.unmount();
+  }
+});
+
+test('robustness: a projection whose settings half is missing or empty is diagnosed, never silent', () => {
+  const cases: Array<[string, unknown]> = [
+    ['no settings key at all', { version: 1, ledger }],
+    ['settings null', { version: 1, settings: null, ledger }],
+    ['settings undefined', { version: 1, settings: undefined, ledger }],
+    ['settings is not an object', { version: 1, settings: 'nope', ledger }],
+  ];
+  for (const [label, projection] of cases) {
+    const loaded = loadBundle();
+    const registration = loaded.slot('conversation.input.dock');
+    const view = mount(loaded, registration, {
+      sessionId: 'session-test',
+      useProjection: (key: string) => (key === 'sessionMetrics' ? projection : undefined),
+    });
+    try {
+      const chip = view.container.querySelector('.dsm-trigger');
+      assert.ok(chip !== null, `${label}: the strip must render a diagnostic, not nothing`);
+      assert.match(view.text(), /waiting/, `${label}: the diagnostic says what it waits for`);
+      assert.match(chip.getAttribute('title')!, /no settings/, `${label}: and names the missing half`);
+    } finally {
+      view.unmount();
+    }
+  }
+});
+
+test('robustness: settings and a ledger with no provider or model is a diagnostic, not a null read', () => {
+  // The projection is present and well-formed, but nothing has recorded a provider or a
+  // model yet — no `modelSelection` and an empty ledger. `current` is null, and the strip
+  // must say so: before this path was guarded it read `current.provider` off null and
+  // threw (`metrics: the strip renders nothing when the provider is unknown`).
+  const emptyLedger: LedgerFixture = { turns: 0, steps: 0, totals: {}, rows: [] };
+  const view = render({ ledger: emptyLedger, settings, selection: null, usage });
+  try {
+    assert.equal(view.text().includes('session-metrics failed'), false, `must not crash: ${view.text().slice(0, 140)}`);
+    assert.match(view.text(), /waiting/, 'the strip renders its diagnostic');
+    assert.match(view.text(), /no provider or model recorded yet/, 'and names the missing half');
   } finally {
     view.unmount();
   }

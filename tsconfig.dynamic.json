@@ -1,13 +1,25 @@
 {
+  // The browser half, plus the one dynamic shim the Host needs.
+  //
+  // `strict: true` (T-004). It was inherited as `strict: false, noImplicitAny: false,
+  // strictNullChecks: false` because DSH publishes no client-slot prop types; those are
+  // now vendored in `types/dsh.d.ts` from the inspector's declared contracts and the
+  // code paths this half actually runs, so the excuses are gone. `strict` here means
+  // `noImplicitAny`, `strictNullChecks`, `strictFunctionTypes`, `strictBindCallApply`,
+  // `strictPropertyInitialization`, `noImplicitThis`, `alwaysStrict` and
+  // `useUnknownInCatchVariables` together — the ramp the T-004 acceptance asked for.
+  //
+  // `src/host/zod.ts` is the remaining `@ts-nocheck` file. It is a hand-written stand-in
+  // for `schemastery`, which is not resolvable from a profile directory, and its
+  // compensating tests are named in its own header. `@ts-nocheck` suppresses a file's
+  // errors whatever `strict` says, so this flag neither hides nor helps it.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "lib": [
       "ES2022",
       "DOM"
     ],
-    "strict": false,
-    "noImplicitAny": false,
-    "strictNullChecks": false
+    "strict": true
   },
   "include": [
     "src/host/zod.ts",

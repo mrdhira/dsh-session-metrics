@@ -14,13 +14,20 @@
  * context, turns, steps and tok/s belong to those pills.
  */
 
-const React = require('react');
+// React arrives through `require` because the bundle is a CommonJS factory. The cast is
+// the seam: `require` is typed as returning `unknown` (that is honest — the loader could
+// hand back anything), `typeof import('react')` is a type-only reference to the package
+// this repo already depends on at runtime, so the framework's own API is stated rather
+// than the bundle's copy of it being hand-declared. React is bundled by nobody (it is
+// external), so the types and the value are the same module.
+const React = require('react') as typeof import('react');
 // A tooltip must not be clipped by the panel's scroll container, and a fixed-position box
 // is still clipped if any ancestor carries a transform. Portalling it to `document.body`
-// escapes both, and the guard keeps a missing module from taking the whole panel down.
-const ReactDOM = (function () {
+// escapes both, and the guard keeps a missing module from taking the whole panel down —
+// which is also why the result is `null`, not a throw, at this boundary.
+const ReactDOM = (function (): typeof import('react-dom') | null {
   try {
-    return require('react-dom');
+    return require('react-dom') as typeof import('react-dom');
   } catch (error) {
     return null;
   }
@@ -34,6 +41,542 @@ const BUILD = typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'dsh-session-met
 const NS = 'sessionMetrics';
 const PROJECTION = 'sessionMetrics';
 const BUDGET_KEY = PLUGIN_ID + '.budget.';
+
+// ------------------------------------------------------------------- shapes
+// The domain shapes this half reads. Two families live here and they are not the
+// same thing: the **resolved** shapes the Host projects (integer-nanodollar rates,
+// `mode: 'flat' | 'peak'`) and the **stored/editor** shapes the settings schema
+// accepts (USD decimal strings, `rates.flat` or `rates.peak`). The editor is the
+// only place they meet, which is why `normalizeProviders` exists at all.
+
+/** The four billing buckets, as a ledger total or the `tokenUsage` projection carries them. */
+interface Buckets {
+  uncachedInputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+}
+
+/** An hour window `[start, end)` in the billing zone; start > end wraps midnight. */
+type HourWindow = [number, number];
+
+/** A resolved rate row: integer nanodollars per 1M tokens, each bucket. */
+interface ResolvedRateRow {
+  cacheHit: number;
+  cacheMiss: number;
+  cacheWrite: number;
+  output: number;
+}
+
+/** A rate row in editor/schema form: USD decimal strings; `cacheWrite` may be absent. */
+interface EditorRateRow {
+  cacheHit?: string;
+  cacheMiss?: string;
+  cacheWrite?: string;
+  output?: string;
+}
+
+/**
+ * The billing calendar: one shape for both the resolved and the stored form.
+ *
+ * `windows` are `[start, end)` hours, `weekdays` are ISO 1-7, `holidays` are
+ * `YYYY-MM-DD` dates written in `holidayZone` — which the Host compares in that
+ * zone, so `tierAt` below must too.
+ */
+interface Billing {
+  timezone: string;
+  weekdays: number[];
+  windows: HourWindow[];
+  holidays: string[];
+  holidayZone: string;
+}
+
+/**
+ * A model card that may arrive resolved or stored.
+ *
+ * `mode` only exists on the resolved shape; the editor's stored shape is detected
+ * by `rates.flat` / `rates.peak` instead. `rates.*` are `ResolvedRateRow` when the
+ * Host resolved them and `EditorRateRow` when they came back out of the schema —
+ * the two are distinguished by the `normalizeProviders` boundary, and this type
+ * deliberately keeps both visible rather than collapsing them into one lie.
+ */
+interface ModelCard {
+  model: string;
+  aliases: string[];
+  label?: string;
+  mode?: 'flat' | 'peak';
+  contextWindow?: number;
+  rates: {
+    flat?: ResolvedRateRow | EditorRateRow | null;
+    peak?: ResolvedRateRow | EditorRateRow | null;
+    offPeak?: ResolvedRateRow | EditorRateRow | null;
+    multiplier?: number;
+  };
+}
+
+/** One provider card, as the settings projection carries it. */
+interface ProviderCard {
+  id: string;
+  label?: string;
+  billing: Billing;
+  models: ModelCard[];
+}
+
+/** Presentation choices from the settings projection. */
+interface DisplaySettings {
+  currency: 'USD' | 'CNY';
+  cnyInDetailsFor: string[];
+  usdToCny: number;
+  labels: string[];
+  details: string[];
+  primaryProvider: string | null;
+}
+
+/** The resolved budget, after the Host's defaults. */
+interface BudgetSettings {
+  sessionUsd: number | null;
+  warnAt: number;
+}
+
+/**
+ * The `sessionMetrics` projection value: what the Host folds for this session.
+ *
+ * Shape read from the Host's own projection (`src/host/index.ts`):
+ * `{ version: 1, settings, ledger: toLedgerView(state) }` — the resolved settings and
+ * the per-step ledger, side by side. `ledger` is absent (not null) on a projection from
+ * a host that has not folded a step yet, which is why every read of it is guarded.
+ */
+interface SessionMetricsValue {
+  version: number;
+  settings: SessionSettingsValue;
+  ledger?: LedgerValue | null;
+}
+
+/** The resolved settings half of the projection. */
+interface SessionSettingsValue {
+  version: number;
+  display: DisplaySettings;
+  budget: BudgetSettings;
+  pricingAsOf: string | null;
+  providers: ProviderCard[];
+  problems: string[];
+}
+
+/** One provider/model/tier price group, as the strip computes it. */
+interface PriceGroup {
+  key: string;
+  provider: string | null;
+  model: string | null;
+  tier: string;
+  buckets: Buckets;
+  /** The rate row priced, or null when the pair has no card for this tier. */
+  rates: ResolvedRateRow | EditorRateRow | null;
+  price: PriceResult | null;
+  savings: number;
+}
+
+/** The four priced buckets plus their total, in integer nanodollars. */
+interface PriceResult {
+  cacheHitNano: number;
+  cacheMissNano: number;
+  cacheWriteNano: number;
+  outputNano: number;
+  totalNano: number;
+}
+
+/** One ledger row, as `toLedgerView` projects it. */
+interface LedgerRow {
+  turn: number;
+  step: number;
+  startTime: number;
+  endTime: number | null;
+  provider: string | null;
+  model: string | null;
+  tier: string;
+  buckets: Buckets;
+}
+
+/** A provider/model pair the ledger observed with no rate card. */
+interface DiscoveredPair {
+  provider: string | null;
+  model: string | null;
+  tokens: number;
+  reports: number;
+  firstSeen: number | null;
+  lastSeen: number | null;
+}
+
+/**
+ * The `ledger` projection.
+ *
+ * An older checkpoint carries no `discovered` field at all, so it is optional —
+ * reading it as present is exactly the class of assumption that crashed the live
+ * strip, and the reader treats absence as an empty list.
+ */
+interface LedgerValue {
+  turns: number;
+  steps: number;
+  totals: Record<string, Buckets>;
+  rows: LedgerRow[];
+  discovered?: DiscoveredPair[];
+}
+
+/** The `modelSelection` projection, limited to the two fields the strip reads. */
+interface ModelSelectionValue {
+  lastUsed?: { provider?: string; model?: string } | null;
+  next?: { provider?: string; model?: string } | null;
+}
+
+/** A provider/model pair, once both halves are known. */
+interface Pair {
+  provider: string;
+  model: string | null;
+}
+
+/** The accepted configuration layer as the pricing page reads it (all fields optional: partial layers are normal). */
+interface ConfigLayer {
+  display?: Partial<DisplaySettings>;
+  budget?: Partial<BudgetSettings>;
+  providers?: unknown;
+  pricingAsOf?: string | null;
+  [key: string]: unknown;
+}
+
+// ------------------------------------------------------------- editor shapes
+// What `normalizeProviders` produces: the stored/schema form, USD decimal strings, no
+// nanodollars and no `mode`. The editor renders and writes this shape, and the Host
+// parses it back. Keeping it distinct from `ProviderCard` is the point — the same code
+// reads both, and treating one as the other is what showed "6000000" as dollars.
+
+/** One model row as the editor holds it. */
+interface EditorModel {
+  model: string;
+  aliases: string[];
+  label?: string;
+  contextWindow?: number;
+  rates: {
+    flat?: EditorRateRow;
+    peak?: EditorRateRow;
+    offPeak?: EditorRateRow;
+    multiplier?: number;
+  };
+}
+
+/** One provider row as the editor holds it. */
+interface EditorProvider {
+  id: string;
+  label?: string;
+  billing: Billing;
+  models: EditorModel[];
+}
+
+/** A draft edit in progress: the rows, fenced by the revision they started from. */
+interface EditorDraft {
+  revision: unknown;
+  providers: EditorProvider[];
+}
+
+/**
+ * The snapshot the pricing page reads: `value` (accepted), `base` (inherited), revision
+ * and writability. `readSnapshot` hands back exactly this shape, narrowed once from the
+ * service's `unknown` face.
+ */
+interface ConfigSnapshot {
+  value?: unknown;
+  base?: unknown;
+  revision?: unknown;
+  writability?: string;
+  writable?: boolean;
+}
+
+// ------------------------------------------------------------- boundary reads
+/**
+ * Narrow an `unknown` boundary value to a bag of fields, or `null`.
+ *
+ * Every value that crosses into this half — a projection, a config layer, a snapshot
+ * from the settings service, a `formatToParts` entry — arrives as `unknown`, and the
+ * job at the boundary is to turn "I hope this is an object" into a check the compiler
+ * tracks. The null prototype is not decoration: it keeps a `value` or `providers`
+ * inherited from `Object.prototype` from ever being read as if it were supplied.
+ * @param value - whatever arrived.
+ * @returns the value as a plain record, or `null` when it is not an object.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object') return null;
+  return Object.assign(Object.create(null) as Record<string, unknown>, value as Record<string, unknown>);
+}
+
+/** A number, or a fallback. Used for every numeric field of a wire value. */
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && isFinite(value) ? value : fallback;
+}
+
+/** A string, or null. */
+function asText(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/** A string list, dropping anything that is not a string. */
+function asTextList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+/** `[start, end)` hour windows, dropping anything that is not a two-number pair. */
+function asWindows(value: unknown): HourWindow[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(function (entry): entry is HourWindow {
+    return Array.isArray(entry) && typeof entry[0] === 'number' && typeof entry[1] === 'number';
+  });
+}
+
+/**
+ * One rate row from either shape the Host serves.
+ *
+ * Resolved rows are numbers, stored rows are USD strings; both are copied through
+ * unchanged so the same object can hold either. An absent row stays absent — that is
+ * the shape whose `peak` is undefined on a flat model, and inventing a value for it
+ * would be the bug rather than the fix.
+ */
+function asRateRow(value: unknown): ResolvedRateRow | EditorRateRow | null {
+  const row = asRecord(value);
+  if (row === null) return null;
+  const out: Record<string, number | string> = {};
+  for (const key of ['cacheHit', 'cacheMiss', 'cacheWrite', 'output'] as const) {
+    const field = row[key];
+    if (typeof field === 'number' || typeof field === 'string') out[key] = field;
+  }
+  return out as ResolvedRateRow | EditorRateRow;
+}
+
+/** One model card from the settings projection. */
+function asModelCard(value: unknown): ModelCard | null {
+  const model = asRecord(value);
+  if (model === null || typeof model.model !== 'string') return null;
+  const rates = asRecord(model.rates) ?? {};
+  const card: ModelCard = { model: model.model, aliases: asTextList(model.aliases), rates: {} };
+  for (const tier of ['flat', 'peak', 'offPeak'] as const) {
+    const row = asRateRow(rates[tier]);
+    if (row !== null) card.rates[tier] = row;
+  }
+  if (typeof rates.multiplier === 'number') card.rates.multiplier = rates.multiplier;
+  if (typeof model.label === 'string') card.label = model.label;
+  if (model.mode === 'flat' || model.mode === 'peak') card.mode = model.mode;
+  if (typeof model.contextWindow === 'number') card.contextWindow = model.contextWindow;
+  return card;
+}
+
+/** The billing calendar from the settings projection, with the schema's own defaults. */
+function asBilling(value: unknown): Billing {
+  const billing = asRecord(value) ?? {};
+  return {
+    timezone: asText(billing.timezone) ?? 'UTC',
+    weekdays: Array.isArray(billing.weekdays)
+      ? billing.weekdays.filter((day): day is number => typeof day === 'number')
+      : [1, 2, 3, 4, 5],
+    windows: asWindows(billing.windows),
+    holidays: asTextList(billing.holidays),
+    holidayZone: asText(billing.holidayZone) ?? 'Asia/Shanghai',
+  };
+}
+
+/** One provider card from the settings projection. */
+function asProviderCard(value: unknown): ProviderCard | null {
+  const provider = asRecord(value);
+  if (provider === null || typeof provider.id !== 'string') return null;
+  const models = Array.isArray(provider.models) ? provider.models : [];
+  const card: ProviderCard = {
+    id: provider.id,
+    billing: asBilling(provider.billing),
+    models: models.map(asModelCard).filter((model): model is ModelCard => model !== null),
+  };
+  if (typeof provider.label === 'string') card.label = provider.label;
+  return card;
+}
+
+/** The `sessionMetrics` projection, read field by field. */
+function asSessionMetrics(value: unknown): SessionMetricsValue | null {
+  const metrics = asRecord(value);
+  if (metrics === null) return null;
+  const settings = asSettings(metrics.settings);
+  if (settings === null) return null;
+  return {
+    version: asNumber(metrics.version, 1),
+    settings: settings,
+    ledger: asLedger(metrics.ledger),
+  };
+}
+
+/** The resolved settings half of the projection. */
+function asSettings(value: unknown): SessionSettingsValue | null {
+  const settings = asRecord(value);
+  if (settings === null) return null;
+  const display = asRecord(settings.display) ?? {};
+  const budget = asRecord(settings.budget) ?? {};
+  const providers = Array.isArray(settings.providers) ? settings.providers : [];
+  return {
+    version: asNumber(settings.version, 1),
+    display: {
+      currency: display.currency === 'CNY' ? 'CNY' : 'USD',
+      cnyInDetailsFor: asTextList(display.cnyInDetailsFor),
+      usdToCny: asNumber(display.usdToCny, 1),
+      labels: asTextList(display.labels),
+      details: asTextList(display.details),
+      primaryProvider: asText(display.primaryProvider),
+    },
+    budget: {
+      sessionUsd: typeof budget.sessionUsd === 'number' ? budget.sessionUsd : null,
+      warnAt: asNumber(budget.warnAt, 0.75),
+    },
+    pricingAsOf: asText(settings.pricingAsOf),
+    providers: providers.map(asProviderCard).filter((provider): provider is ProviderCard => provider !== null),
+    problems: asTextList(settings.problems),
+  };
+}
+
+/**
+ * The ledger projection.
+ *
+ * `discovered` is optional on purpose: a checkpoint written before that field existed
+ * carries none, and reading it as present is exactly the assumption that produced a
+ * live crash. Absent becomes an empty list here, once.
+ */
+function asLedger(value: unknown): LedgerValue | null {
+  const ledger = asRecord(value);
+  if (ledger === null) return null;
+  const totalsRecord = asRecord(ledger.totals) ?? {};
+  const totals: Record<string, Buckets> = {};
+  for (const key of Object.keys(totalsRecord)) totals[key] = asBuckets(totalsRecord[key]);
+  const rows = Array.isArray(ledger.rows) ? ledger.rows : [];
+  const discovered = Array.isArray(ledger.discovered) ? ledger.discovered : [];
+  return {
+    turns: asNumber(ledger.turns, 0),
+    steps: asNumber(ledger.steps, 0),
+    totals: totals,
+    rows: rows.map(asLedgerRow).filter((row): row is LedgerRow => row !== null),
+    discovered: discovered.map(asDiscoveredPair).filter((pair): pair is DiscoveredPair => pair !== null),
+  };
+}
+
+/** One token-bucket set, as a ledger total carries it. */
+function asBuckets(value: unknown): Buckets {
+  const buckets = asRecord(value) ?? {};
+  return {
+    uncachedInputTokens: asNumber(buckets.uncachedInputTokens, 0),
+    cacheReadTokens: asNumber(buckets.cacheReadTokens, 0),
+    cacheWriteTokens: asNumber(buckets.cacheWriteTokens, 0),
+    outputTokens: asNumber(buckets.outputTokens, 0),
+  };
+}
+
+/** One ledger row. */
+function asLedgerRow(value: unknown): LedgerRow | null {
+  const row = asRecord(value);
+  if (row === null) return null;
+  return {
+    turn: asNumber(row.turn, 0),
+    step: asNumber(row.step, 0),
+    startTime: asNumber(row.startTime, 0),
+    endTime: typeof row.endTime === 'number' ? row.endTime : null,
+    provider: asText(row.provider),
+    model: asText(row.model),
+    tier: asText(row.tier) ?? 'flat',
+    buckets: asBuckets(row.buckets),
+  };
+}
+
+/** One observed-but-unpriced pair. */
+function asDiscoveredPair(value: unknown): DiscoveredPair | null {
+  const pair = asRecord(value);
+  if (pair === null) return null;
+  return {
+    provider: asText(pair.provider),
+    model: asText(pair.model),
+    tokens: asNumber(pair.tokens, 0),
+    reports: asNumber(pair.reports, 0),
+    firstSeen: typeof pair.firstSeen === 'number' ? pair.firstSeen : null,
+    lastSeen: typeof pair.lastSeen === 'number' ? pair.lastSeen : null,
+  };
+}
+
+/**
+ * The writer face of a form, or null when it carries no `mutate`.
+ *
+ * The guard is on the method actually called, in one place: `save` used to repeat
+ * `typeof form.mutate !== 'function'` after the form had already been narrowed, which
+ * is impossible to keep honest once `form` is `unknown`.
+ * @param form - the form as the page holds it.
+ * @returns the typed writer, or null.
+ */
+function asWriter(form: unknown): DshConfigForm | null {
+  const candidate = asRecord(form);
+  if (candidate === null || typeof candidate.mutate !== 'function') return null;
+  return candidate as DshConfigForm;
+}
+
+/** The rows of a draft, or an empty list when there is no draft. */
+function rowsOf(draft: EditorDraft | null): EditorProvider[] {
+  return draft === null ? [] : draft.providers;
+}
+
+/**
+ * A provider list from either a resolved settings layer or an already-normalized one.
+ *
+ * `base` is the inherited layer, which the Host serves in the schema's own shape but
+ * which a test (or a future version) may hand over already normalized; both are read
+ * through `normalizeProviders` so the caller sees the editor shape either way.
+ * @param providers - the raw list from a config layer, if there is one.
+ * @returns the rows.
+ */
+function asProviderList(providers: unknown): EditorProvider[] {
+  // The inherited layer is the Host's **resolved** tree (integer nanodollar rates,
+  // `mode`), not the editor's USD-string form, so it is copied field by field before the
+  // one normalizer runs. Reading it as `EditorProvider[]` would be the exact mistake that
+  // showed "6000000" as dollars.
+  if (!Array.isArray(providers)) return [];
+  const entries: unknown[] = providers;
+  const cards: ProviderCard[] = [];
+  for (const entry of entries) {
+    const card = asProviderCard(entry);
+    if (card !== null) cards.push(card);
+  }
+  return normalizeProviders(cards);
+}
+
+/**
+ * One configuration layer from the settings snapshot.
+ *
+ * The layer is partial by design: the Host exposes only the fields it serves, so
+ * `display`, `budget` and `providers` may each be absent, and each takes the schema's
+ * own default. Normalizing here is what lets the rest of the pricing page assume a
+ * shape instead of guarding every read — and it is the boundary a partial layer must
+ * cross, which is how the live `JSON.parse(JSON.stringify(undefined))` crash reached
+ * the number formatting before.
+ * @param value - the `value` or `base` layer from the snapshot.
+ * @returns the layer the page renders from.
+ */
+function asConfigLayer(value: unknown): ConfigLayer {
+  const layer = asRecord(value) ?? {};
+  const display = asRecord(layer.display) ?? {};
+  const budget = asRecord(layer.budget) ?? {};
+  const labels = asTextList(display.labels);
+  const details = asTextList(display.details);
+  return {
+    display: {
+      currency: display.currency === 'CNY' ? 'CNY' : 'USD',
+      cnyInDetailsFor: asTextList(display.cnyInDetailsFor),
+      usdToCny: asNumber(display.usdToCny, 7.1),
+      labels: labels.length > 0 ? labels : ['peak', 'time', 'cost', 'saved', 'provider'],
+      details: details.length > 0 ? details : ['cost', 'savings', 'models', 'window'],
+      primaryProvider: asText(display.primaryProvider),
+    },
+    budget: {
+      sessionUsd: typeof budget.sessionUsd === 'number' ? budget.sessionUsd : null,
+      warnAt: asNumber(budget.warnAt, 0.75),
+    },
+    providers: Array.isArray(layer.providers) ? layer.providers : [],
+    pricingAsOf: asText(layer.pricingAsOf),
+  };
+}
 
 // ---------------------------------------------------------------- styles
 const STYLES = [
@@ -124,13 +667,13 @@ const NANO = 1e9;
 const PER_MILLION = 1e6;
 
 /** Integer nanodollars from a token count and a per-1M nanodollar rate. */
-function costOf(rateNano, tokens) {
+function costOf(rateNano: number | null | undefined, tokens: number | null | undefined): number {
   if (!rateNano || !tokens) return 0;
   return Math.round((rateNano * tokens) / PER_MILLION);
 }
 
-/** Integer nanodollars to a USD string. */
-function usd(nano, digits) {
+/** Integer nanodollars to a USD string; null when there is no figure to show. */
+function usd(nano: number | null | undefined, digits?: number): string | null {
   if (nano === null || nano === undefined || !isFinite(nano)) return null;
   const places = digits === undefined ? 4 : digits;
   const whole = Math.floor(Math.abs(nano) / NANO);
@@ -145,7 +688,7 @@ function usd(nano, digits) {
  * `usd` truncates, which is right for internal figures but wrong for a label a
  * person compares against a bill.
  */
-function usd2(nano) {
+function usd2(nano: number | null | undefined): string | null {
   if (nano === null || nano === undefined || !isFinite(nano)) return null;
   const cents = Math.round(Math.abs(nano) / 1e7);
   // A session that has cost something must not read as free: below a cent, say so.
@@ -154,7 +697,7 @@ function usd2(nano) {
 }
 
 /** The city part of an IANA zone: `Asia/Tokyo` becomes `Tokyo`. */
-function cityOf(zone) {
+function cityOf(zone: string | null | undefined): string {
   const tail = String(zone || 'UTC').split('/').pop() || 'UTC';
   return tail.replace(/_/g, ' ');
 }
@@ -165,9 +708,9 @@ function cityOf(zone) {
  * `window` used to mean "the peak flag and the clock in one chip"; it now maps to
  * the separate `peak` and `time` chips so existing profile configs keep rendering.
  */
-function labelKeys(labels) {
-  const out = [];
-  const add = function (key) { if (out.indexOf(key) < 0) out.push(key); };
+function labelKeys(labels: unknown): string[] {
+  const out: string[] = [];
+  const add = function (key: string): void { if (out.indexOf(key) < 0) out.push(key); };
   (Array.isArray(labels) ? labels : []).forEach(function (key) {
     if (key === 'window') { add('peak'); add('time'); }
     else if (key === 'savings') { add('saved'); }
@@ -178,8 +721,7 @@ function labelKeys(labels) {
 }
 
 /** Every token bucket a session can be billed for. */
-function bucketTotal(buckets) {
-  if (!buckets) return 0;
+function bucketTotal(buckets: Buckets): number {
   return buckets.uncachedInputTokens + buckets.cacheReadTokens + buckets.cacheWriteTokens + buckets.outputTokens;
 }
 
@@ -189,7 +731,7 @@ function bucketTotal(buckets) {
  * Derived from today's offset between the two zones, which is what a reader wants
  * from a one-line "in your local time" hint.
  */
-function windowInZone(nowMs, window, providerZone, viewerZone) {
+function windowInZone(nowMs: number, window: HourWindow, providerZone: string, viewerZone: string): string {
   const at = zoned(new Date(nowMs), providerZone);
   const midnight = nowMs - ((at.hour * 60 + at.minute) * 60000) - (nowMs % 60000);
   const start = midnight + window[0] * 3600000;
@@ -210,7 +752,7 @@ const TIPS = {
 };
 
 /** Compact token counts, used only where the pills do not already show them. */
-function tokens(value) {
+function tokens(value: unknown): string {
   if (typeof value !== 'number' || !isFinite(value)) return '—';
   if (value >= 1e9) return (value / 1e9).toFixed(2) + 'B';
   if (value >= 1e6) return (value / 1e6).toFixed(2) + 'M';
@@ -219,7 +761,7 @@ function tokens(value) {
 }
 
 /** One decimal percentage. */
-function pct(value) {
+function pct(value: unknown): string {
   if (typeof value !== 'number' || !isFinite(value)) return '—';
   return (value * 100).toFixed(1) + '%';
 }
@@ -233,10 +775,10 @@ function pct(value) {
  * second while the detail panel ticked — enough to run a test process out of
  * memory.
  */
-const zoneFormatters = new Map();
+const zoneFormatters = new Map<string, Intl.DateTimeFormat>();
 
 /** The cached formatter for one zone. */
-function formatterFor(zone) {
+function formatterFor(zone: string): Intl.DateTimeFormat {
   let formatter = zoneFormatters.get(zone);
   if (formatter === undefined) {
     formatter = new Intl.DateTimeFormat('en-US', {
@@ -248,12 +790,30 @@ function formatterFor(zone) {
   return formatter;
 }
 
+/** The calendar fields `zoned` reads off one formatted instant. */
+interface ZonedFields {
+  weekday: number;
+  hour: number;
+  minute: number;
+  day: number;
+  month: number;
+  date: string;
+}
+
+/** ISO weekday numbers, keyed by the `weekday: 'short'` token `en-US` emits. */
+const WEEKDAY_NUMBERS: Record<string, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+
 /** Calendar fields for an instant in a zone. */
-function zoned(date, zone) {
+function zoned(date: Date, zone: string): ZonedFields {
   const parts = formatterFor(zone).formatToParts(date);
-  const at: Record<string, any> = {};
-  for (const p of parts) if (p.type !== 'literal') at[p.type] = p.value;
-  const day = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }[at.weekday] || 0;
+  // `formatToParts` returns a discriminated union whose `value` lives only on the
+  // non-literal members; collecting into a plain map keeps that narrowing in one place.
+  const at: Record<string, string> = {};
+  for (const part of parts) if (part.type !== 'literal') at[part.type] = part.value;
+  // A missing token is not a silent zero: `Intl` always emits these for this pattern, so
+  // a fallback would only ever hide a broken formatter. The lookup is typed as possibly
+  // absent rather than asserted present.
+  const day = WEEKDAY_NUMBERS[at.weekday ?? ''] ?? 0;
   return {
     weekday: day,
     hour: at.hour === '24' ? 0 : Number(at.hour),
@@ -265,33 +825,34 @@ function zoned(date, zone) {
 }
 
 /** The billing tier for one instant under one provider's calendar. */
-function tierAt(ms, billing) {
-  const windows = (billing && billing.windows) || [];
+function tierAt(ms: number, billing: Billing): 'flat' | 'peak' | 'off-peak' {
+  const windows = billing.windows;
   if (windows.length === 0) return 'flat';
   const zone = billing.timezone || 'UTC';
   const at = zoned(new Date(ms), zone);
-  if (((billing.weekdays) || []).indexOf(at.weekday) < 0) return 'off-peak';
+  if (billing.weekdays.indexOf(at.weekday) < 0) return 'off-peak';
   // Holiday dates are written in `holidayZone`, which is not necessarily the
   // billing zone. The Host's own `tierAt` resolves them there, so a chip that
   // read them in the provider zone could show peak on a day the Host charged
   // off-peak.
-  const holidays = (billing && billing.holidays) || [];
+  const holidays = billing.holidays;
   if (holidays.length > 0
-    && holidays.indexOf(zoned(new Date(ms), (billing && billing.holidayZone) || zone).date) >= 0) return 'off-peak';
+    && holidays.indexOf(zoned(new Date(ms), billing.holidayZone || zone).date) >= 0) return 'off-peak';
   const inside = windows.some(function (w) {
     return w[0] <= w[1] ? at.hour >= w[0] && at.hour < w[1] : at.hour >= w[0] || at.hour < w[1];
   });
   return inside ? 'peak' : 'off-peak';
 }
 
-/** The next instant the tier changes, or null for a flat rate. */
-function nextBoundary(ms, billing) {
-  const windows = (billing && billing.windows) || [];
+/** The next instant the tier changes, or null for a flat rate (or no calendar at all). */
+function nextBoundary(ms: number, billing: Billing | null): number | null {
+  if (billing === null) return null;
+  const windows = billing.windows;
   if (windows.length === 0) return null;
   const current = tierAt(ms, billing);
   const hourMs = 3600000;
   const start = Math.floor(ms / hourMs) * hourMs;
-  let boundary = null;
+  let boundary: number | null = null;
   for (let step = 1; step <= 24 * 4; step += 1) {
     const candidate = start + step * hourMs;
     if (tierAt(candidate, billing) !== current) { boundary = candidate; break; }
@@ -336,9 +897,9 @@ interface BadgePayload {
  * @param form - the form or controller the badge read.
  * @returns the accepted value layer, or null when there is none.
  */
-function badgeValue(form: any) {
+function badgeValue(form: unknown): unknown {
   const snap = readSnapshot(form);
-  if (snap === null || snap === undefined) return null;
+  if (snap === null) return null;
   if (!Object.prototype.hasOwnProperty.call(snap, 'value')) return null;
   const value = snap.value;
   return value === undefined || value === null ? null : value;
@@ -360,16 +921,18 @@ function badgeValue(form: any) {
  * @param nowMs - the instant to read the calendar at.
  * @returns the payload, or null when the badge must stay away.
  */
-function badgePayload(value: any, nowMs: number): BadgePayload | null {
-  const providers = value && Array.isArray(value.providers) ? value.providers : [];
+function badgePayload(value: unknown, nowMs: number): BadgePayload | null {
+  const layer = asRecord(value);
+  const providers: unknown[] = layer !== null && Array.isArray(layer.providers) ? layer.providers : [];
   if (providers.length === 0) return null;
   let models = 0;
-  let calendar = null;
+  let calendar: Billing | null = null;
   let zone = 'UTC';
-  let tierProvider = null;
-  providers.forEach(function (provider) {
-    if (Array.isArray(provider && provider.models)) models += provider.models.length;
-    const billing = normalizeProviders([provider])[0].billing;
+  let tierProvider: string | null = null;
+  providers.forEach(function (entry) {
+    const provider = asRecord(entry);
+    if (provider !== null && Array.isArray(provider.models)) models += provider.models.length;
+    const billing = normalizeProviders([entry])[0].billing;
     if (billing.windows.length === 0) return;
     // The first provider with a peak window supplies the calendar: that is the state
     // the chip names, and the title names that provider rather than attributing its
@@ -377,7 +940,7 @@ function badgePayload(value: any, nowMs: number): BadgePayload | null {
     if (calendar === null) {
       calendar = billing;
       zone = billing.timezone;
-      tierProvider = provider && typeof provider.id === 'string' && provider.id !== ''
+      tierProvider = provider !== null && typeof provider.id === 'string' && provider.id !== ''
         ? provider.id
         : 'the first provider with peak windows';
     }
@@ -409,7 +972,7 @@ function badgePayload(value: any, nowMs: number): BadgePayload | null {
  * keep claiming the tier it saw when the page first rendered. A flat calendar has
  * no boundary, so it costs no timer at all.
  */
-function BadgeView(props) {
+function BadgeView(props: { value: unknown }): React.ReactNode {
   const nowState = useState(function () { return Date.now(); });
   const nowMs = nowState[0];
   const setNowMs = nowState[1];
@@ -427,7 +990,9 @@ function BadgeView(props) {
     payload.models + (payload.models === 1 ? ' model' : ' models'),
   ];
   if (payload.tier !== null) segments.push(payload.tier);
-  const children: any[] = [];
+  // `string | object` deliberately: the separator is a bare text child while a tier is
+  // a styled element, which is what React's own children type accepts.
+  const children: Array<string | ReturnType<typeof h>> = [];
   segments.forEach(function (part, index) {
     if (index > 0) children.push('\u00b7');
     if (part === 'peak' || part === 'off-peak') {
@@ -457,36 +1022,42 @@ function BadgeView(props) {
  * @param props - slot props plus the `getService` getter `apply` supplies.
  * @returns the badge, or null when there is no real value to show.
  */
-function PluginBadge(props) {
-  const propsGet = props && typeof props.getService === 'function' ? props.getService : null;
+function PluginBadge(props: DshSlotProps & { serviceGet?: (name: string) => unknown }): React.ReactNode {
+  const propsGet = typeof props.getService === 'function' ? props.getService : null;
   const getService = propsGet === null ? props.serviceGet : propsGet;
-  const stableGet = useCallback(function (name) {
+  const stableGet = useCallback(function (name: string): unknown {
     return getService && typeof getService === 'function' ? getService(name) : undefined;
   }, [getService]);
-  const service = useMemo(function () {
+  const service = useMemo(function (): DshConfigFormsService | null {
     if (typeof getService !== 'function') return null;
     const found = stableGet('configForms');
-    return found === undefined || found === null ? null : found;
+    return found !== undefined && found !== null && typeof found === 'object'
+      ? found as DshConfigFormsService
+      : null;
   }, [stableGet, getService]);
   // `ctx.get('configForms')` returns the service itself; `service.get(namespace)` returns
   // this plugin's form. `undefined` and `null` are both normal on a restricted context,
   // and a deployment without a settings service simply renders no badge. A *throw* is not
   // caught: the boundary wraps this component and shows it.
-  const form = useMemo(function () {
+  const form = useMemo(function (): DshConfigForm | null {
     if (service === null || typeof service.get !== 'function') return null;
     const found = service.get(SETTINGS_NS);
     return found === undefined || found === null ? null : found;
   }, [service]);
   // A form without `subscribe` is absence, not failure: the owner-supplied shape
   // carries none, and the value still arrives through `getSnapshot`.
-  const subscribe = useCallback(function (listener) {
+  const subscribe = useCallback(function (listener: () => void): () => void {
     if (form === null || typeof form.subscribe !== 'function') return function () {};
     const unsubscribe = form.subscribe(listener);
     return function () {
       if (typeof unsubscribe === 'function') unsubscribe();
     };
   }, [form]);
-  const getSnapshot = useCallback(function () {
+  // The accepted layer is returned **by reference**. A copy here would make
+  // `useSyncExternalStore` see a new snapshot on every read and re-render forever
+  // (React: "Maximum update depth exceeded"), which is exactly what a defensive
+  // `asRecord` copy did before this comment existed. Narrowing happens in `BadgeView`.
+  const getSnapshot = useCallback(function (): unknown {
     return form === null ? null : badgeValue(form);
   }, [form]);
   const value = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
@@ -494,13 +1065,13 @@ function PluginBadge(props) {
 }
 
 /** `hh:mm` for an instant in a zone. */
-function clock(ms, zone) {
+function clock(ms: number, zone: string): string {
   const at = zoned(new Date(ms), zone);
   return String(at.hour).padStart(2, '0') + ':' + String(at.minute).padStart(2, '0');
 }
 
 /** A human countdown. */
-function countdown(from, to) {
+function countdown(from: number, to: number): string {
   const minutes = Math.max(0, Math.floor((to - from) / 60000));
   if (minutes < 1) return 'less than a minute';
   const hrs = Math.floor(minutes / 60);
@@ -511,22 +1082,37 @@ function countdown(from, to) {
 
 // ----------------------------------------------------------- projections
 /** Token bucket totals from either shape the projection may serve. */
-function tokenBuckets(value) {
-  const source = value && value.totals ? value.totals : (value || {});
+function tokenBuckets(value: unknown): Buckets {
+  const source = asRecord(value);
+  const totals = source !== null && asRecord(source.totals) !== null ? asRecord(source.totals) : source;
   return {
-    uncachedInputTokens: source.uncachedInputTokens || 0,
-    cacheReadTokens: source.cacheReadTokens || 0,
-    cacheWriteTokens: source.cacheWriteTokens || 0,
-    outputTokens: source.outputTokens || 0,
+    uncachedInputTokens: countOf(totals?.uncachedInputTokens),
+    cacheReadTokens: countOf(totals?.cacheReadTokens),
+    cacheWriteTokens: countOf(totals?.cacheWriteTokens),
+    outputTokens: countOf(totals?.outputTokens),
   };
 }
 
+/**
+ * A token count, or zero.
+ *
+ * The `unknown` boundary is why this exists: a count is a number or it is absent, and
+ * an absent count is zero tokens. A non-numeric value is zero too — the same thing
+ * `previous || 0` did before it was typed, without needing a cast to say it.
+ * @param value - whatever the projection carried.
+ * @returns the count as a number.
+ */
+function countOf(value: unknown): number {
+  return typeof value === 'number' && isFinite(value) ? value : 0;
+}
+
 /** The session's provider/model from the model-selection projection. */
-function selection(value) {
-  if (!value) return null;
-  const used = value.lastUsed || value.next;
-  if (!used || !used.provider || !used.model) return null;
-  return { provider: used.provider, model: used.model };
+function selection(value: unknown): Pair | null {
+  const source = asRecord(value);
+  if (source === null) return null;
+  const used = asRecord(source.lastUsed) ?? asRecord(source.next);
+  if (used === null || !used.provider || !used.model) return null;
+  return { provider: String(used.provider), model: String(used.model) };
 }
 
 /**
@@ -536,59 +1122,87 @@ function selection(value) {
  * @param value - the projection value.
  * @returns the status word.
  */
-function sourceState(value) {
+function sourceState(value: unknown): 'absent' | 'null' | 'present' {
   if (value === undefined) return 'absent';
   if (value === null) return 'null';
   return 'present';
 }
 
 /** The last provider/model the ledger recorded, as a fallback selection. */
-function selectionFromLedger(ledger) {
-  const rows = ledger && ledger.rows ? ledger.rows : [];
+function selectionFromLedger(ledger: LedgerValue | null): Pair | null {
+  const rows = ledger !== null ? ledger.rows : [];
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const row = rows[index];
-    if (row && row.provider) return { provider: row.provider, model: row.model };
+    if (row.provider) return { provider: row.provider, model: row.model };
   }
-  const keys = Object.keys((ledger && ledger.totals) || {});
+  const keys = ledger !== null ? Object.keys(ledger.totals) : [];
   for (const key of keys) {
     const parts = key.split('\u0000');
-    if (parts[0]) return { provider: parts[0], model: parts[1] || null };
+    const provider = parts[0];
+    if (provider) return { provider: provider, model: parts[1] || null };
   }
   return null;
 }
 
-/** The rate row a resolved model charges at one tier. */
-function ratesAt(model, tier) {
-  if (!model) return null;
+/**
+ * The rate row a resolved model charges at one tier.
+ *
+ * `undefined` is a real answer, not a failure: a card can carry a `flat` row and no
+ * `peak` one, which is exactly the shape that threw `rates.peak.cacheReadTokens` live.
+ */
+function ratesAt(model: ModelCard | null, tier: string): ResolvedRateRow | EditorRateRow | null | undefined {
+  if (model === null) return null;
   if (model.mode === 'flat') return model.rates.flat;
   return tier === 'peak' ? model.rates.peak : model.rates.offPeak;
 }
 
+/** One found card: the provider and model, or both null when the pair has no card. */
+interface CardMatch {
+  provider: ProviderCard | null;
+  model: ModelCard | null;
+}
+
 /** Find a provider and model card for a reported pair. */
-function findCard(providers, providerId, modelId) {
-  const provider = (providers || []).find(function (p) { return p.id === providerId; }) || null;
-  if (!provider) return { provider: null, model: null };
+function findCard(providers: ProviderCard[], providerId: string | null, modelId: string | null): CardMatch {
+  const provider = providers.find(function (p) { return p.id === providerId; }) ?? null;
+  if (provider === null) return { provider: null, model: null };
   const model = provider.models.find(function (m) {
-    return m.model === modelId || (m.aliases || []).indexOf(modelId) >= 0;
-  }) || null;
+    return m.model === modelId || m.aliases.indexOf(modelId ?? '') >= 0;
+  }) ?? null;
   return { provider: provider, model: model };
 }
 
-/** Price one bucket set against one rate row. */
-function priceBuckets(rates, buckets) {
-  if (!rates) return null;
-  const hit = costOf(rates.cacheHit, buckets.cacheReadTokens);
-  const miss = costOf(rates.cacheMiss, buckets.uncachedInputTokens);
-  const write = costOf(rates.cacheWrite, buckets.cacheWriteTokens);
-  const out = costOf(rates.output, buckets.outputTokens);
+/** Price one bucket set against one rate row; null when there is no rate row. */
+function priceBuckets(
+  rates: ResolvedRateRow | EditorRateRow | null | undefined,
+  buckets: Buckets,
+): PriceResult | null {
+  if (rates === null || rates === undefined) return null;
+  // The rate a resolved card carries is a number; the editor's string form never reaches
+  // here (only resolved settings are priced), so a missing field is zero nanodollars.
+  const hit = costOf(countOf(rates.cacheHit), buckets.cacheReadTokens);
+  const miss = costOf(countOf(rates.cacheMiss), buckets.uncachedInputTokens);
+  const write = costOf(countOf(rates.cacheWrite), buckets.cacheWriteTokens);
+  const out = costOf(countOf(rates.output), buckets.outputTokens);
   return { cacheHitNano: hit, cacheMissNano: miss, cacheWriteNano: write, outputNano: out, totalNano: hit + miss + write + out };
 }
 
 /** What the cache saved on one bucket set. */
-function savingsOf(rates, buckets) {
-  if (!rates) return 0;
-  const diff = rates.cacheMiss - rates.cacheHit;
+function savingsOf(rates: ResolvedRateRow | EditorRateRow | null | undefined, buckets: Buckets): number {
+  if (rates === null || rates === undefined) return 0;
+  const diff = countOf(rates.cacheMiss) - countOf(rates.cacheHit);
   return diff > 0 ? costOf(diff, buckets.cacheReadTokens) : 0;
+}
+
+/** What `priceSession` returns: the groups plus the session-wide figures. */
+interface SessionPrice {
+  groups: PriceGroup[];
+  totalNano: number | null;
+  savedNano: number | null;
+  peakNano: number;
+  peakShare: number | null;
+  priced: boolean;
+  byModel: Array<{ model: string | null; nano: number; tokens: number }>;
 }
 
 /**
@@ -596,15 +1210,15 @@ function savingsOf(rates, buckets) {
  * fall back to the current selection's card for buckets recorded before a
  * model was known.
  */
-function priceSession(settings, ledger, selectionValue, now) {
-  const groups = [];
+function priceSession(settings: SessionSettingsValue, ledger: LedgerValue): SessionPrice {
+  const groups: PriceGroup[] = [];
   let total = 0;
   let saved = 0;
   let priced = true;
   let peakNano = 0;
-  const byModel = new Map();
+  const byModel = new Map<string, { model: string | null; nano: number; tokens: number }>();
 
-  Object.keys(ledger.totals || {}).forEach(function (key) {
+  Object.keys(ledger.totals).forEach(function (key) {
     const parts = key.split('\u0000');
     const providerId = parts[0] || null;
     const modelId = parts[1] || null;
@@ -614,9 +1228,9 @@ function priceSession(settings, ledger, selectionValue, now) {
     const tier = storedTier;
     const rates = ratesAt(card.model, tier);
     const price = priceBuckets(rates, buckets);
-    const group = {
+    const group: PriceGroup = {
       key: key, provider: providerId, model: modelId, tier: tier, buckets: buckets,
-      rates: rates, price: price, savings: savingsOf(rates, buckets),
+      rates: rates ?? null, price: price, savings: savingsOf(rates, buckets),
     };
     groups.push(group);
     if (price === null) { priced = false; return; }
@@ -650,25 +1264,25 @@ function priceSession(settings, ledger, selectionValue, now) {
  * registration ledger, and the user sees an empty space with no clue. Catching the
  * failure here keeps the entry alive and puts the message where it can be read.
  */
-class MetricsBoundary extends React.Component {
-  constructor(props) {
+class MetricsBoundary extends React.Component<{ children?: React.ReactNode }, { error: unknown }> {
+  constructor(props: { children?: React.ReactNode }) {
     super(props);
     this.state = { error: null };
   }
 
-  static getDerivedStateFromError(error) {
+  static getDerivedStateFromError(error: unknown): { error: unknown } {
     return { error };
   }
 
-  componentDidCatch(error) {
+  componentDidCatch(error: unknown): void {
     if (typeof console !== 'undefined' && console.error) console.error('session-metrics render failed', error);
   }
 
-  render() {
+  render(): React.ReactNode {
     if (this.state.error === null) return this.props.children;
-    const error = this.state.error;
-    const message = error && error.message ? error.message : String(error);
-    const stack = error && error.stack ? String(error.stack).split('\n').slice(0, 6).join(' | ') : '';
+    const error = asRecord(this.state.error);
+    const message = typeof error?.message === 'string' ? error.message : String(this.state.error);
+    const stack = typeof error?.stack === 'string' ? error.stack.split('\n').slice(0, 6).join(' | ') : '';
     return h('div', { className: 'dsm-slot', 'data-safe': 'false' },
       h('div', { className: 'dsm-root' },
         h('span', { className: 'dsm-trigger dsm-diag', title: stack || message },
@@ -679,15 +1293,21 @@ class MetricsBoundary extends React.Component {
   }
 }
 
-/** A labelled cell. */
-/**
- * A metric label with its explanation.
+/** Props for the one explanation affordance: where to anchor the box, and its text. */
+interface HintProps {
+  label: string;
+  title: string;
+  onShow(node: Element, text: string): void;
+  onHide(): void;
+}
+
+/** A metric label with its explanation.
  *
  * Native `title` tooltips did not surface in the harness window, so the explanation is a
  * child element revealed by CSS on hover or keyboard focus. The same text is the accessible
  * name, so assistive technology gets it too.
  */
-function Hint(props: any) {
+function Hint(props: HintProps): React.ReactNode {
   // The box cannot live inside the hint: the panel scrolls, and an absolutely positioned
   // child of a scroll container is clipped at its edge — which cropped long text and the
   // right-hand column. It is rendered once, fixed, and clamped to the viewport instead.
@@ -695,9 +1315,9 @@ function Hint(props: any) {
     className: 'dsm-hint',
     'aria-label': props.title,
     tabIndex: 0,
-    onMouseEnter: function (event: any) { props.onShow(event.currentTarget, props.title); },
+    onMouseEnter: function (event: React.MouseEvent<HTMLElement>) { props.onShow(event.currentTarget, props.title); },
     onMouseLeave: props.onHide,
-    onFocus: function (event: any) { props.onShow(event.currentTarget, props.title); },
+    onFocus: function (event: React.FocusEvent<HTMLElement>) { props.onShow(event.currentTarget, props.title); },
     onBlur: props.onHide,
   },
     props.label,
@@ -705,8 +1325,15 @@ function Hint(props: any) {
 }
 
 
+/** One segment of a proportional bar. */
+interface BarSegment {
+  key: string;
+  value: number;
+  className: string;
+}
+
 /** A proportional bar. */
-function Bar(props) {
+function Bar(props: { title: string; segments: BarSegment[] }): React.ReactNode {
   let total = 0;
   props.segments.forEach(function (s) { if (s.value > 0) total += s.value; });
   if (total <= 0) return null;
@@ -723,19 +1350,16 @@ function Bar(props) {
 
 // ---------------------------------------------------------------- panel
 /** The strip and its detail popover. */
-function SessionMetricsPanel(props) {
+function SessionMetricsPanel(props: DshSlotProps & { refreshProjections?: (sessionId?: string) => void }): React.ReactNode {
   // Lost props are a fault, not an empty session: without `useProjection` the strip
   // can never price anything, and silence would hide the reason.
   const frameworkPropsMissing = typeof props.useProjection !== 'function';
-  const metrics = props.useProjection ? props.useProjection(PROJECTION) : undefined;
-  const usageValue = props.useProjection ? props.useProjection('tokenUsage') : undefined;
-  const selectionValue = props.useProjection ? props.useProjection('modelSelection') : undefined;
 
     /** The floating explanation: its text and its clamped viewport position. */
-  const tipState = useState(null);
+  const tipState = useState<{ text: string; left: number; top: number; above: boolean } | null>(null);
   const tip = tipState[0];
   const setTip = tipState[1];
-  const showTip = useCallback(function (node: any, text: string) {
+  const showTip = useCallback(function (node: Element, text: string) {
     if (!node || typeof node.getBoundingClientRect !== 'function' || typeof window === 'undefined') return;
     const rect = node.getBoundingClientRect();
     const margin = 12;
@@ -746,11 +1370,11 @@ function SessionMetricsPanel(props) {
   }, []);
   const hideTip = useCallback(function () { setTip(null); }, []);
 
-const openState = useState(false);
+  const openState = useState(false);
   const open = openState[0];
   const setOpen = openState[1];
-  const rootRef = useRef(null);
-  const anchorState = useState(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const anchorState = useState<{ left: number; top: number; bottom: number } | null>(null);
   const anchor = anchorState[0];
   const setAnchor = anchorState[1];
   const nowState = useState(Date.now());
@@ -761,15 +1385,23 @@ const openState = useState(false);
     if (typeof props.refreshProjections === 'function') props.refreshProjections(props.sessionId);
   }, [props.refreshProjections, props.sessionId]);
 
-  const settings = metrics && metrics.settings ? metrics.settings : null;
-  const ledger = metrics && metrics.ledger ? metrics.ledger : null;
+  // The projection is a cross-half wire value, so it arrives as `unknown` and is narrowed
+  // here rather than trusted: `metrics.budget.sessionUsd` on a wrong-shaped projection is the
+  // same class of read that crashed the live strip on `rates.peak`.
+  const rawMetrics: unknown = props.useProjection ? props.useProjection(PROJECTION) : undefined;
+  const metrics = asSessionMetrics(rawMetrics);
+  const usageValue: unknown = props.useProjection ? props.useProjection('tokenUsage') : undefined;
+  const selectionValue: unknown = props.useProjection ? props.useProjection('modelSelection') : undefined;
+
+  const settings: SessionSettingsValue | null = metrics === null ? null : metrics.settings;
+  const ledger: LedgerValue | null = metrics === null || metrics.ledger === undefined ? null : metrics.ledger;
   // The ledger carries the provider and model of every step, so it is a sufficient
   // source on its own; `modelSelection` is preferred because it is the catalogue the
   // composer's own model picker uses.
-  const current = selection(selectionValue) || selectionFromLedger(ledger);
+  const current = selection(selectionValue) ?? selectionFromLedger(ledger);
   const buckets = tokenBuckets(usageValue);
-  const labels = labelKeys(settings && settings.display ? settings.display.labels : []);
-  const details = settings && settings.display && settings.display.details ? settings.display.details : [];
+  const labels = labelKeys(settings === null ? [] : settings.display.labels);
+  const details = settings === null ? [] : settings.display.details;
   const wantsClock = labels.indexOf('time') >= 0 || labels.indexOf('peak') >= 0;
 
   // The collapsed strip shows a real clock now, so it ticks — aligned to the minute
@@ -791,8 +1423,8 @@ const openState = useState(false);
 
   useEffect(function () {
     if (!open) return undefined;
-    const onKey = function (event) { if (event.key === 'Escape') setOpen(false); };
-    const onResize = function () { setOpen(false); };
+    const onKey = function (event: KeyboardEvent): void { if (event.key === 'Escape') setOpen(false); };
+    const onResize = function (): void { setOpen(false); };
     window.addEventListener('keydown', onKey);
     window.addEventListener('resize', onResize);
     return function () {
@@ -807,25 +1439,26 @@ const openState = useState(false);
   // The session identity is a note rather than a fault: the projections are already
   // session-scoped by the framework, and gating on a prop the owner may not pass is
   // what once made this strip invisible.
-  const hasAnyProjection = metrics !== undefined || usageValue !== undefined || selectionValue !== undefined;
-  const missing = [];
-  const notes = [];
+  const missing: string[] = [];
+  const notes: string[] = [];
   if (frameworkPropsMissing) missing.push('the framework props are missing (no useProjection was passed)');
   if (props.sessionId === undefined) notes.push('the session identity prop is missing (projections still resolve)');
-  if (metrics === undefined) missing.push('the sessionMetrics projection is absent');
+  if (rawMetrics === undefined) missing.push('the sessionMetrics projection is absent');
   else if (settings === null) missing.push('the projection carries no settings');
   else if (ledger === null) missing.push('the projection carries no ledger');
   if (current === null) missing.push('no provider or model recorded yet');
   const reasons = missing.concat(notes);
 
-  const priced = useMemo(function () {
-    if (!settings || !ledger) return null;
-    return priceSession(settings, ledger, current, now);
-  }, [settings, ledger, current && current.provider, current && current.model]);
+  const priced: SessionPrice | null = useMemo(function () {
+    if (settings === null || ledger === null) return null;
+    return priceSession(settings, ledger);
+  }, [settings, ledger, current?.provider, current?.model]);
 
-  const card = settings && current ? findCard(settings.providers, current.provider, current.model) : { provider: null, model: null };
-  const billing = card.provider ? card.provider.billing : null;
-  const tier = billing ? tierAt(now, billing) : null;
+  const card: CardMatch = settings !== null && current !== null
+    ? findCard(settings.providers, current.provider, current.model)
+    : { provider: null, model: null };
+  const billing = card.provider !== null ? card.provider.billing : null;
+  const tier = billing !== null ? tierAt(now, billing) : null;
   // The countdown is only visible inside the open detail, so the search does not run
   // at all while the strip is collapsed — and while open it is recomputed at most once
   // a minute, since within a minute the answer cannot change.
@@ -833,13 +1466,13 @@ const openState = useState(false);
   const boundary = useMemo(
     function () { return open && billing !== null ? nextBoundary(minute * 60000, billing) : null; },
     [open, billing, minute]);
-  const viewerZone = (function () {
+  const viewerZone = (function (): string {
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) { return 'UTC'; }
   })();
 
-  const budgetLimit = (settings && settings.budget.sessionUsd) || null;
-  const warnAt = settings && settings.budget ? settings.budget.warnAt : 0.75;
-  const spentNano = priced ? priced.totalNano : null;
+  const budgetLimit = settings === null ? null : settings.budget.sessionUsd;
+  const warnAt = settings === null ? 0.75 : settings.budget.warnAt;
+  const spentNano = priced !== null ? priced.totalNano : null;
   const budgetFraction = budgetLimit && spentNano !== null ? (spentNano / NANO) / budgetLimit : null;
 
   if (missing.length > 0) {
@@ -860,7 +1493,7 @@ const openState = useState(false);
                 h('div', { className: 'dsm-section' }, 'Waiting on'),
                 h('ul', { className: 'dsm-list' }, reasons.map(function (reason, index) { return h('li', { key: index }, reason); })),
                 h('div', { className: 'dsm-section' }, 'Sources read'),
-                h('div', { className: 'dsm-note' }, 'sessionMetrics: ' + sourceState(metrics) +
+                h('div', { className: 'dsm-note' }, 'sessionMetrics: ' + sourceState(rawMetrics) +
                   ' \u00b7 tokenUsage: ' + sourceState(usageValue) +
                   ' \u00b7 modelSelection: ' + sourceState(selectionValue)),
                 h('div', { className: 'dsm-foot' }, h('span', null, 'build ' + BUILD),
@@ -868,12 +1501,22 @@ const openState = useState(false);
           : null));
   }
 
-  const showCny = settings.display.cnyInDetailsFor.indexOf(current.provider) >= 0 || settings.display.currency === 'CNY';
+  // `missing` was empty, which means settings, ledger and provider/model are all present —
+  // but that fact lives in an array, so the compiler cannot carry it into the callbacks
+  // below. These guards restate it in a form `tsc` tracks: delete one and the reads below
+  // fail the typecheck (TS18047) *and* the strip renders nothing at runtime, instead of
+  // throwing on `current.provider` the way the live crashes did.
+  const resolvedSettings = settings;
+  const books = ledger;
+  const pair = current;
+  if (resolvedSettings === null || books === null || pair === null) return null;
+
+  const showCny = resolvedSettings.display.cnyInDetailsFor.indexOf(pair.provider) >= 0 || resolvedSettings.display.currency === 'CNY';
   const costNano = priced ? priced.totalNano : null;
   const savedNano = priced ? priced.savedNano : null;
 
   // ---------------------------------------------------------------- strip chips
-  const chips = [];
+  const chips: React.ReactNode[] = [];
   if (labels.indexOf('peak') >= 0 && (tier === 'peak' || tier === 'off-peak')) {
     const peak = tier === 'peak';
     chips.push(h('span', {
@@ -910,11 +1553,11 @@ const openState = useState(false);
       h('span', null, 'Saved'),
       h('b', { className: 'dsm-mono' }, usd2(savedNano))));
   }
-  if (labels.indexOf('provider') >= 0 && current.provider !== settings.display.primaryProvider) {
+  if (labels.indexOf('provider') >= 0 && pair.provider !== resolvedSettings.display.primaryProvider) {
     chips.push(h('span', {
       key: 'provider', className: 'dsm-model',
       title: 'Provider this session is using (from modelSelection).',
-    }, current.provider));
+    }, pair.provider));
   }
   if (labels.indexOf('budget') >= 0 && budgetLimit) {
     const className = budgetFraction === null ? '' : budgetFraction >= 1 ? ' dsm-over' : budgetFraction >= warnAt ? ' dsm-warn' : '';
@@ -938,7 +1581,7 @@ const openState = useState(false);
       setNow(Date.now());
       setOpen(true);
     },
-  }, chips.reduce(function (list: any[], chip: any, index: number) {
+  }, chips.reduce(function (list: React.ReactNode[], chip: React.ReactNode, index: number) {
     // A dot between every pair: the chips read as separate facts on one line rather than
     // one run-on label.
     if (index > 0) list.push(h('span', { key: 'sep' + index, className: 'dsm-sep' }, '\u00b7'));
@@ -947,20 +1590,20 @@ const openState = useState(false);
   }, []));
 
   // ------------------------------------------------------------------- detail
-  let panel = null;
+  let panel: React.ReactNode = null;
   if (open) {
     const top = anchor ? Math.max(12, anchor.top - 12) : 140;
     const left = anchor ? Math.min(Math.max(12, anchor.left), Math.max(12, window.innerWidth - 580)) : 24;
-    const sections = [];
+    const sections: React.ReactNode[] = [];
 
     const groups = priced ? priced.groups : [];
     // Pairs the ledger actually observed with no rate card. An older checkpoint
     // carries no `discovered` field at all, so it is read as an empty list.
-    const discovered = Array.isArray(ledger.discovered) ? ledger.discovered : [];
-    const sumNano = function (pick) {
+    const discovered = Array.isArray(books.discovered) ? books.discovered : [];
+    const sumNano = function (pick: (price: PriceResult) => number): number {
       return groups.reduce(function (total, group) { return total + (group.price ? pick(group.price) : 0); }, 0);
     };
-    const sumTokens = function (pick) {
+    const sumTokens = function (pick: (buckets: Buckets) => number): number {
       return groups.reduce(function (total, group) { return total + (group.buckets ? pick(group.buckets) : 0); }, 0);
     };
     const inputNano = sumNano(function (p) { return p.cacheMissNano + p.cacheWriteNano; });
@@ -1001,7 +1644,7 @@ const openState = useState(false);
               h('div', { className: 'dsm-note' },
                 'Total ' + usd2(priced.totalNano) + ' \u00b7 ' + tokens(sessionTokens) + ' tokens'
                 + (budgetLimit ? ' \u00b7 budget ' + usd2(budgetLimit * NANO) + ' (' + pct(budgetFraction) + ')' : '')
-                + (showCny ? ' \u00b7 \u00a5' + ((spentNano / NANO) * settings.display.usdToCny).toFixed(2) : '')))
+                + (showCny && spentNano !== null ? ' \u00b7 \u00a5' + ((spentNano / NANO) * resolvedSettings.display.usdToCny).toFixed(2) : '')))
           : h('div', { className: 'dsm-note dsm-warn' }, 'No rate card matches this session\u2019s provider and model, so no cost is shown. Add one in the plugin\u2019s Pricing section, or in cordis.patch.yml.')));
     }
 
@@ -1016,7 +1659,7 @@ const openState = useState(false);
         });
         return tok > 0 ? (nano / NANO) / (tok / 1e6) : null;
       })();
-      const cacheShare = priced.totalNano > 0 ? cachedNano / priced.totalNano : null;
+      const cacheShare = (priced.totalNano ?? 0) > 0 ? cachedNano / (priced.totalNano ?? 0) : null;
       sections.push(h('div', { key: 'savings' },
         h('div', { className: 'dsm-section' }, 'Saving breakdown'),
         h('div', { className: 'dsm-cols' },
@@ -1039,8 +1682,8 @@ const openState = useState(false);
           // and "Off". A row is a provider+model, so the tiers are summed and the
           // peak-hours column reports the state that provider is in right now.
           const modelRows = (function () {
-            const byKey = new Map<string, any>();
-            groups.forEach(function (group: any) {
+            const byKey = new Map<string, { provider: string | null; model: string | null; nano: number; tokens: number; priced: boolean }>();
+            groups.forEach(function (group) {
               const key = (group.provider || '') + '\u0000' + (group.model || '');
               const entry = byKey.get(key) || { provider: group.provider, model: group.model, nano: 0, tokens: 0, priced: true };
               if (group.price) {
@@ -1051,7 +1694,7 @@ const openState = useState(false);
               }
               byKey.set(key, entry);
             });
-            return Array.from(byKey.values()).sort(function (a: any, b: any) { return b.nano - a.nano; });
+            return Array.from(byKey.values()).sort(function (a, b) { return b.nano - a.nano; });
           })();
           const shown = modelRows.slice(0, 8);
           sections.push(h('div', { key: 'models' },
@@ -1059,8 +1702,8 @@ const openState = useState(false);
             h('table', { className: 'dsm-table' },
               h('thead', null, h('tr', null,
                 h('th', null, 'provider'), h('th', null, 'model'), h('th', null, 'peak hours'))),
-              h('tbody', null, shown.map(function (row: any, index: number) {
-                const rowCard = findCard(settings.providers, row.provider, row.model);
+              h('tbody', null, shown.map(function (row, index) {
+                const rowCard = findCard(resolvedSettings.providers, row.provider, row.model);
                 const rowBilling = rowCard.provider ? rowCard.provider.billing : null;
                 const hasWindows = rowBilling !== null && rowBilling.windows.length > 0;
                 // The card's own label is what the composer shows ("DeepSeek V4.1 Flash"),
@@ -1094,7 +1737,7 @@ const openState = useState(false);
           const listed = discovered.slice(0, 8);
           sections.push(h('div', { key: 'discovered' },
             h('div', { className: 'dsm-section' }, 'Seen, unpriced'),
-            h('ul', { className: 'dsm-list' }, listed.map(function (entry: any, index: number) {
+            h('ul', { className: 'dsm-list' }, listed.map(function (entry, index) {
               const provider = entry && entry.provider ? entry.provider : 'unknown provider';
               const model = entry && entry.model ? entry.model : 'unknown model';
               const seen = entry && typeof entry.tokens === 'number' ? tokens(entry.tokens) + ' tokens' : 'no tokens';
@@ -1107,7 +1750,7 @@ const openState = useState(false);
               ? h('div', { className: 'dsm-note' }, 'plus ' + (discovered.length - listed.length) + ' more unpriced pairs')
               : null,
             h('div', { className: 'dsm-note' }, 'No cost is counted for these. Add a rate card on this plugin\u2019s component row under '
-              + PLUGIN_ID + ' to price them; a provider\u2019s free models cost $0.00 and need a zero-rate card.')));
+              + PLUGIN_ID + ' \u203a ' + SETTINGS_NS + ' to price them; a provider\u2019s free models cost $0.00 and need a zero-rate card.')));
         }
 
         if (details.indexOf('window') >= 0 && billing) {
@@ -1173,10 +1816,10 @@ const openState = useState(false);
           h('span', {
             title: 'build ' + BUILD
               + ' \u00b7 tokens from tokenUsage, provider and model from modelSelection, rate cards and tiers from sessionMetrics'
-              + (settings.problems.length > 0 ? ' \u00b7 config problems: ' + settings.problems.join('; ') : ''),
+              + (resolvedSettings.problems.length > 0 ? ' \u00b7 config problems: ' + resolvedSettings.problems.join('; ') : ''),
           }, 'Session Metrics'),
-          h('span', { className: 'dsm-tag dsm-model', title: current.provider + ' \u00b7 ' + current.model },
-            current.provider + ' \u00b7 ' + current.model)),
+          h('span', { className: 'dsm-tag dsm-model', title: pair.provider + ' \u00b7 ' + pair.model },
+            pair.provider + ' \u00b7 ' + pair.model)),
         sections));
   }
 
@@ -1211,8 +1854,8 @@ const CONFIG_ENTRY = 'include:' + SETTINGS_NS;
 const ROW_CONFIG_KEY = PLUGIN_ID + '#' + SETTINGS_NS;
 
 /** Parse "1-4,6-10" into peak windows. */
-function parseWindows(text) {
-  const windows = [];
+function parseWindows(text: string): HourWindow[] {
+  const windows: HourWindow[] = [];
   for (const part of String(text || '').split(',')) {
     const match = part.trim().match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
     if (match === null) continue;
@@ -1222,12 +1865,12 @@ function parseWindows(text) {
 }
 
 /** Render peak windows for editing. */
-function formatWindows(windows) {
-  return (windows || []).map(function (w) { return w[0] + '-' + w[1]; }).join(',');
+function formatWindows(windows: HourWindow[]): string {
+  return windows.map(function (w) { return w[0] + '-' + w[1]; }).join(',');
 }
 
 /** Integer nanodollars per 1M as the USD string the schema accepts. */
-function usdFromNano(nano) {
+function usdFromNano(nano: number): string {
   const text = (nano / 1e9).toFixed(9).replace(/0+$/, '').replace(/\.$/, '');
   return text === '' ? '0' : text;
 }
@@ -1244,14 +1887,14 @@ function usdFromNano(nano) {
  * @returns providers whose rate rows hold USD decimal strings.
  */
 /** One rate value as a USD string: resolved layers carry nanodollar numbers. */
-function usdValue(value) {
+function usdValue(value: unknown): string {
   if (typeof value === 'number') return usdFromNano(value);
   if (typeof value === 'string') return value;
   return '0';
 }
 
 /** A complete rate row, so no field is ever missing from the editor. */
-function usdRow(row) {
+function usdRow(row: ResolvedRateRow | EditorRateRow | null | undefined): EditorRateRow {
   const source = row || {};
   return {
     cacheHit: usdValue(source.cacheHit),
@@ -1275,41 +1918,47 @@ function usdRow(row) {
  * @param providers - either shape.
  * @returns providers the editor can render and the Host will accept.
  */
-function normalizeProviders(providers) {
+function normalizeProviders(providers: unknown): EditorProvider[] {
   if (!Array.isArray(providers)) return [];
-  return providers.map(function (provider) {
-    const source = provider || {};
+  return providers.map(function (entry): EditorProvider {
+    const source = asRecord(entry) ?? {};
     const models = Array.isArray(source.models) ? source.models : [];
-    const normalized: Record<string, any> = {
+    const modelCards = models.map(function (model): EditorModel {
+      const card = asRecord(model) ?? {};
+      const rates = asRecord(card.rates) ?? {};
+      const out: EditorModel['rates'] = {};
+      // Absent rate rows stay absent; a flat model has no `peak`, which is exactly the
+      // shape whose `.cacheHit` read crashed the live page.
+      for (const key of ['flat', 'peak', 'offPeak'] as const) {
+        const row = rates[key];
+        if (row !== undefined && row !== null) out[key] = usdRow(asRateRow(row) ?? {});
+      }
+      if (out.flat === undefined && out.peak === undefined) out.flat = usdRow(null);
+      out.multiplier = typeof rates.multiplier === 'number' ? rates.multiplier : 0.5;
+      const result: EditorModel = {
+        model: typeof card.model === 'string' ? card.model : '',
+        aliases: asTextList(card.aliases),
+        rates: out,
+      };
+      if (typeof card.label === 'string') result.label = card.label;
+      if (typeof card.contextWindow === 'number') result.contextWindow = card.contextWindow;
+      return result;
+    });
+    const billing = asRecord(source.billing) ?? {};
+    const normalized: EditorProvider = {
       id: typeof source.id === 'string' ? source.id : '',
-      models: models.map(function (model) {
-        const entry = model || {};
-        const rates = entry.rates || {};
-        const out: Record<string, any> = {};
-        for (const key of ['flat', 'peak', 'offPeak']) {
-          if (rates[key] !== undefined && rates[key] !== null) out[key] = usdRow(rates[key]);
-        }
-        if (out.flat === undefined && out.peak === undefined) out.flat = usdRow(null);
-        out.multiplier = typeof rates.multiplier === 'number' ? rates.multiplier : 0.5;
-        const result: Record<string, any> = {
-          model: typeof entry.model === 'string' ? entry.model : '',
-          aliases: Array.isArray(entry.aliases) ? entry.aliases.slice() : [],
-          rates: out,
-        };
-        if (typeof entry.label === 'string') result.label = entry.label;
-        if (typeof entry.contextWindow === 'number') result.contextWindow = entry.contextWindow;
-        return result;
-      }),
+      models: modelCards,
+      billing: {
+        timezone: typeof billing.timezone === 'string' ? billing.timezone : 'UTC',
+        weekdays: Array.isArray(billing.weekdays)
+          ? billing.weekdays.filter((day): day is number => typeof day === 'number')
+          : [1, 2, 3, 4, 5],
+        windows: asWindows(billing.windows),
+        holidays: asTextList(billing.holidays),
+        holidayZone: typeof billing.holidayZone === 'string' ? billing.holidayZone : 'Asia/Shanghai',
+      },
     };
     if (typeof source.label === 'string') normalized.label = source.label;
-    const billing = source.billing || {};
-    normalized.billing = {
-      timezone: typeof billing.timezone === 'string' ? billing.timezone : 'UTC',
-      weekdays: Array.isArray(billing.weekdays) ? billing.weekdays.slice() : [1, 2, 3, 4, 5],
-      windows: Array.isArray(billing.windows) ? billing.windows.map(function (w) { return [w[0], w[1]]; }) : [],
-      holidays: Array.isArray(billing.holidays) ? billing.holidays.slice() : [],
-      holidayZone: typeof billing.holidayZone === 'string' ? billing.holidayZone : 'Asia/Shanghai',
-    };
     return normalized;
   });
 }
@@ -1323,20 +1972,20 @@ function normalizeProviders(providers) {
  * @param providers - providers whose rate rows hold USD decimal strings.
  * @returns the YAML block.
  */
-function toYaml(providers) {
+function toYaml(providers: EditorProvider[]): string {
   const lines = ['config:', '  providers:'];
-  (providers || []).forEach(function (provider) {
+  providers.forEach(function (provider) {
     lines.push('    - id: ' + provider.id);
     lines.push('      billing: { timezone: ' + provider.billing.timezone + ', windows: [' +
       provider.billing.windows.map(function (w) { return '[' + w[0] + ',' + w[1] + ']'; }).join(', ') + '] }');
     lines.push('      models:');
-    (provider.models || []).forEach(function (model) {
+    provider.models.forEach(function (model) {
       const flat = model.rates.flat !== undefined;
       const rates = flat ? model.rates.flat : model.rates.peak;
       if (rates === null || rates === undefined) return;
       lines.push('        - model: ' + model.model);
-      lines.push('          rates: { ' + (flat ? 'flat' : 'peak') + ': { cacheHit: ' + rates.cacheHit +
-        ', cacheMiss: ' + rates.cacheMiss + ', output: ' + rates.output + ' } }');
+      lines.push('          rates: { ' + (flat ? 'flat' : 'peak') + ': { cacheHit: ' + String(rates.cacheHit) +
+        ', cacheMiss: ' + String(rates.cacheMiss) + ', output: ' + String(rates.output) + ' } }');
     });
   });
   return lines.join('\n') + '\n';
@@ -1348,26 +1997,44 @@ function toYaml(providers) {
  * @param form - either shape.
  * @returns the snapshot, or null when there is none yet.
  */
-function readSnapshot(form) {
-  if (form === null || form === undefined) return null;
-  if (form.state !== undefined && form.state !== null) return form.state;
-  if (typeof form.getSnapshot === 'function') return form.getSnapshot();
+function readSnapshot(form: unknown): ConfigSnapshot | null {
+  const candidate = asRecord(form);
+  if (candidate === null) return null;
+  const state = candidate.state;
+  if (state !== undefined && state !== null) {
+    const snap = asRecord(state);
+    if (snap !== null) return snap as ConfigSnapshot;
+  }
+  const getSnapshot = candidate.getSnapshot;
+  if (typeof getSnapshot === 'function') {
+    const snap = asRecord(getSnapshot.call(form));
+    if (snap !== null) return snap as ConfigSnapshot;
+  }
   return null;
 }
 
+/** Props for one editable rate row. */
+interface RateFieldsProps {
+  row: EditorRateRow | null | undefined;
+  onChange(field: string, value: string): void;
+}
+
 /** One editable rate row. */
-function RateFields(props) {
+function RateFields(props: RateFieldsProps): React.ReactNode {
   // `props.row` was undefined for a flat model read as a peak one, and indexing it
   // threw `Cannot read properties of undefined (reading 'cacheHit')` live.
-  const row = props.row || {};
-  const fields = [['cacheHit', 'cache hit'], ['cacheMiss', 'cache miss'], ['cacheWrite', 'cache write'], ['output', 'output']];
+  const row: EditorRateRow = props.row ?? {};
+  const fields: Array<[keyof EditorRateRow, string]> = [
+    ['cacheHit', 'cache hit'], ['cacheMiss', 'cache miss'], ['cacheWrite', 'cache write'], ['output', 'output'],
+  ];
   return h('div', { className: 'dsm-rates' }, fields.map(function (pair) {
+    const value = row[pair[0]];
     return h('label', { key: pair[0], className: 'dsm-rate' },
       h('span', null, pair[1]),
       h('input', {
         type: 'text', inputMode: 'decimal', className: 'dsm-input',
-        value: row[pair[0]] === undefined ? '' : String(row[pair[0]]),
-        onChange: function (event) { props.onChange(pair[0], event.target.value); },
+        value: value === undefined ? '' : String(value),
+        onChange: function (event: React.ChangeEvent<HTMLInputElement>) { props.onChange(pair[0], event.target.value); },
       }));
   }));
 }
@@ -1383,7 +2050,7 @@ function RateFields(props) {
  * draft. A deployment that serves no namespace for this entry falls back to a
  * read-only summary plus the equivalent YAML.
  */
-function PricingPage(props) {
+function PricingPage(props: DshSlotProps): React.ReactNode {
   // The slot owner hands the page its own form and says which half to render:
   // `summary` is the one-liner on the row, `page` is the editor. Preferring the
   // supplied form matters — reading it from the service instead works only when
@@ -1396,22 +2063,23 @@ function PricingPage(props) {
   // Resolved on every render rather than captured when the plugin applied: the
   // settings service may arrive after this bundle, and a page stuck on a stale
   // `undefined` would stay read-only for the life of the page.
-  const service = props.getService ? props.getService('configForms') : props.configForms;
-  const form = supplied !== null
-    ? supplied
-    : (service && typeof service.get === 'function' ? service.get(SETTINGS_NS) : null);
-  const snapState = useState(null);
+  const service: DshConfigFormsService | null = props.getService
+    ? (asRecord(props.getService('configForms')) as DshConfigFormsService | null)
+    : props.configForms ?? null;
+  const fromService = service !== null && typeof service.get === 'function' ? service.get(SETTINGS_NS) : null;
+  const form: unknown = supplied !== null ? supplied : fromService ?? null;
+  const snapState = useState<ConfigSnapshot | null>(null);
   const snapshot = snapState[0];
   const setSnapshot = snapState[1];
-  const draftState = useState(null);
+  const draftState = useState<EditorDraft | null>(null);
   const draft = draftState[0];
   const setDraft = draftState[1];
-  const noticeState = useState(null);
+  const noticeState = useState<string | null>(null);
   const notice = noticeState[0];
   // What the last successful write contained. The owner-supplied form has no
   // subscription, so the snapshot on this render can predate the write; without this
   // the page appeared to roll back even though the Host had persisted the change.
-  const savedState = useState(null);
+  const savedState = useState<EditorProvider[] | null>(null);
   const savedProviders = savedState[0];
   const setSavedProviders = savedState[1];
   const setNotice = noticeState[1];
@@ -1421,39 +2089,29 @@ function PricingPage(props) {
       setSnapshot(null);
       return undefined;
     }
-    setSnapshot(readSnapshot(form) ?? null);
+    setSnapshot(readSnapshot(form));
     // The owner-supplied shape carries no subscription: the page re-renders from its
     // own store when the served namespace changes.
-    if (typeof form.subscribe !== 'function') return undefined;
-    return form.subscribe(function () { setSnapshot(readSnapshot(form)); });
+    const candidate = asRecord(form);
+    if (candidate === null || typeof candidate.subscribe !== 'function') return undefined;
+    const unsubscribe = candidate.subscribe(function () { setSnapshot(readSnapshot(form)); });
+    return typeof unsubscribe === 'function' ? unsubscribe : undefined;
   }, [form]);
 
   // `value` is the accepted configuration; `base` is what an override would inherit
   // (the shipped cards plus the profile patch). Falling back to `base` keeps the
   // editor usable when a Host has not published an accepted value yet, instead of
   // showing a read-only page for no reason.
-  const accepted = snapshot !== null && snapshot !== undefined && snapshot.value !== undefined && snapshot.value !== null ? snapshot.value : null;
-  const inherited = snapshot !== null && snapshot !== undefined && snapshot.base !== undefined && snapshot.base !== null ? snapshot.base : null;
+  const accepted: unknown = snapshot !== null && snapshot.value !== undefined && snapshot.value !== null ? snapshot.value : null;
+  const inherited: unknown = snapshot !== null && snapshot.base !== undefined && snapshot.base !== null ? snapshot.base : null;
   const raw = accepted !== null ? accepted : inherited;
   const showingInherited = accepted === null && inherited !== null;
   // A config layer can arrive partial: the Host exposes only the fields it serves, so
   // `display`, `budget` and `providers` may each be missing. Normalize once here and
   // the rest of the page can assume the shape.
-  const resolved = raw === null || raw === undefined ? null : {
-    display: Object.assign({
-      currency: 'USD',
-      cnyInDetailsFor: [],
-      usdToCny: 7.1,
-      labels: ['peak', 'time', 'cost', 'saved', 'provider'],
-      details: ['cost', 'savings', 'models', 'window'],
-      primaryProvider: null,
-    }, raw.display || {}),
-    budget: Object.assign({ sessionUsd: null, warnAt: 0.75 }, raw.budget || {}),
-    providers: Array.isArray(raw.providers) ? raw.providers : [],
-    pricingAsOf: raw.pricingAsOf === undefined ? null : raw.pricingAsOf,
-  };
-  const base = snapshot && snapshot.base ? snapshot.base : null;
-  const revision = snapshot ? snapshot.revision : null;
+  const resolved: ConfigLayer | null = raw === null || raw === undefined ? null : asConfigLayer(raw);
+  const base: ConfigLayer | null = snapshot !== null && snapshot.base !== null && snapshot.base !== undefined ? asConfigLayer(snapshot.base) : null;
+  const revision = snapshot === null ? null : snapshot.revision;
   const clean = draft === null || draft.revision !== revision;
 
   // The Host resolves rates to nanodollars for computing; the editor must show
@@ -1465,9 +2123,9 @@ function PricingPage(props) {
     setSavedProviders(null);
   }, [revision]);
 
-  const displayProviders = useMemo(function () {
+  const displayProviders: EditorProvider[] = useMemo(function () {
     if (resolved === null) return [];
-    if (!clean) return draft.providers;
+    if (!clean) return rowsOf(draft);
     if (savedProviders !== null) return savedProviders;
     return normalizeProviders(resolved.providers);
   }, [resolved, clean, draft, savedProviders]);
@@ -1478,16 +2136,27 @@ function PricingPage(props) {
     //     ROW page), so it points at the row instead of showing an empty block;
     //   - a row page can be read-only before the Host serves the namespace, where the
     //     rates still come from cordis.patch.yml.
-    const yamlProviders = resolved !== null && Array.isArray(resolved.providers) ? resolved.providers : [];
+    // `resolved` is null on this branch by construction, so there are no providers to
+    // show; reading `resolved.providers` here was the site of a dead `never` narrowing.
+    const yamlProviders: EditorProvider[] = [];
     const diagnostics = (function () {
-      const service = props.getService ? props.getService('configForms') : undefined;
+      // Re-read the service here: the diagnostics must report on the layer the page
+      // actually read, and `asRecord` narrows the `unknown` getter result once.
+      const described: DshConfigFormsService | null = props.getService
+        ? asRecord(props.getService('configForms')) as DshConfigFormsService | null
+        : null;
       let served = 'unavailable';
-      if (service !== undefined && service !== null && typeof service.describe === 'function') {
+      if (described !== null && typeof described.describe === 'function') {
         try {
-          const mirror = service.describe();
-          const snap = mirror && typeof mirror.getSnapshot === 'function' ? mirror.getSnapshot() : mirror;
-          const view = snap && snap.view ? snap.view : snap;
-          const namespaces = view && Array.isArray(view.namespaces) ? view.namespaces.map(function (e) { return e && e.ns ? e.ns : String(e); }) : null;
+          const mirror = asRecord(described.describe());
+          const getSnapshot = mirror?.getSnapshot;
+          const snap = mirror !== null && typeof getSnapshot === 'function'
+            ? asRecord(getSnapshot.call(mirror))
+            : mirror;
+          const view = asRecord(snap?.view) ?? snap;
+          const namespaces = view !== null && Array.isArray(view.namespaces)
+            ? view.namespaces.map(function (e) { const entry = asRecord(e); return entry !== null && typeof entry.ns === 'string' ? entry.ns : String(e); })
+            : null;
           served = namespaces === null ? 'unknown' : namespaces.join(', ') || 'none';
         } catch (error) {
           served = 'unreadable';
@@ -1515,27 +2184,40 @@ function PricingPage(props) {
       yamlProviders.length > 0 ? h('pre', { className: 'dsm-pre' }, toYaml(yamlProviders)) : null);
   }
 
+  /**
+   * The form as a writer, or null when it carries no `mutate`.
+   *
+   * Guarded on the method actually called: a form exposing `mutate` but not `set` would
+   * otherwise swallow the click and save nothing. The narrowing lives here once, so
+   * `save` reads a typed writer instead of re-checking `unknown`.
+   */
+  const writer = asWriter(form);
+
+  /** The rows as they currently stand, dirty or clean. */
+  const currentRows = function (): EditorProvider[] {
+    return clean ? normalizeProviders(resolved?.providers) : rowsOf(draft);
+  };
+
   /** Start a draft from the values currently on screen. */
-  const begin = function () {
+  const begin = function (): void {
     if (!clean) return;
-    setDraft({ revision: revision, providers: normalizeProviders(resolved.providers) });
+    setDraft({ revision: revision, providers: normalizeProviders(resolved?.providers) });
   };
 
   /** Apply one edit to the draft, cloning so React sees a new value. */
-  const update = function (mutate) {
-    const next = JSON.parse(JSON.stringify(clean ? normalizeProviders(resolved.providers) : draft.providers));
+  const update = function (mutate: (next: EditorProvider[]) => void): void {
+    const next = JSON.parse(JSON.stringify(currentRows())) as EditorProvider[];
     mutate(next);
     setDraft({ revision: draft !== null && draft.revision === revision ? draft.revision : revision, providers: next });
   };
 
   /** Write the draft, fenced by the revision read when editing began. */
-  const save = function () {
-    // Guard on the method actually called: a form exposing `mutate` but not `set` would
-    // otherwise swallow the click and save nothing.
-    if (form === null || typeof form.mutate !== 'function') return;
-    const providersToWrite = clean ? normalizeProviders(resolved.providers) : draft.providers;
+  const save = function (): void {
+    const candidate = asRecord(form);
+    if (writer === null || candidate === null || typeof candidate.mutate !== 'function') return;
+    const providersToWrite = currentRows();
     const ops = [{ op: 'set', path: ['providers'], value: providersToWrite }];
-    Promise.resolve(form.mutate(ops, revision)).then(function (accepted) {
+    Promise.resolve(candidate.mutate(ops, revision)).then(function (accepted) {
       if (accepted === false) {
         setNotice('The Host refused the change, so nothing was saved. Your edits are still here \u2014 copy the block below if you prefer to set them in cordis.patch.yml.');
       } else {
@@ -1545,23 +2227,26 @@ function PricingPage(props) {
         setDraft(null);
         setNotice('Saved. These rates are in use from the next step on.');
       }
-    }).catch(function (error) {
-      setNotice('Saving failed: ' + (error && error.message ? error.message : String(error)) + '. Your edits are kept.');
+    }).catch(function (error: unknown) {
+      const reason = asRecord(error);
+      setNotice('Saving failed: ' + (typeof reason?.message === 'string' ? reason.message : String(error)) + '. Your edits are kept.');
     });
   };
 
   const providers = displayProviders;
 
   if (view === 'summary') {
-    const modelCount = providers.reduce(function (total, provider) { return total + (provider.models || []).length; }, 0);
+    const modelCount = providers.reduce(function (total, provider) { return total + provider.models.length; }, 0);
     const parts = [providers.length + ' providers', modelCount + ' models'];
-    if (resolved.budget && resolved.budget.sessionUsd) parts.push('budget $' + resolved.budget.sessionUsd.toFixed(2));
+    const sessionUsd = resolved === null ? null : resolved.budget?.sessionUsd;
+    if (sessionUsd) parts.push('budget $' + sessionUsd.toFixed(2));
     if (snapshot !== null && snapshot.writability === 'read-only') parts.push('read-only');
     return h('span', { className: 'dsm-summary' }, parts.join(' \u00b7 '));
   }
 
   const providerCards = providers.map(function (provider, providerIndex) {
-    const baseProvider = base && base.providers ? base.providers.filter(function (p) { return p.id === provider.id; })[0] : null;
+    const baseProviders = asProviderList(base?.providers);
+    const baseProvider = baseProviders.filter(function (p) { return p.id === provider.id; })[0] ?? null;
     return h('div', { className: 'dsm-card', key: provider.id + providerIndex },
       h('div', { className: 'dsm-cardHead' },
         h('input', {
@@ -1575,7 +2260,8 @@ function PricingPage(props) {
           title: baseProvider === null ? 'No shipped card for this provider' : 'Restore the shipped rates for this provider',
           onClick: function () {
             if (baseProvider === null) return;
-            update(function (next) { next[providerIndex] = normalizeProviders([baseProvider])[0]; });
+            const shipped = normalizeProviders([baseProvider])[0];
+            update(function (next) { next[providerIndex] = shipped; });
           },
         }, 'reset to shipped'),
         h('button', {
@@ -1607,7 +2293,7 @@ function PricingPage(props) {
       provider.models.map(function (model, modelIndex) {
         const isFlat = model.rates.flat !== undefined;
         const row = isFlat ? model.rates.flat : model.rates.peak;
-        const swap = function (mode) {
+        const swap = function (mode: 'flat' | 'peak'): void {
           begin();
           update(function (next) {
             const target = next[providerIndex].models[modelIndex];
@@ -1617,7 +2303,7 @@ function PricingPage(props) {
             else { target.rates.peak = source || zero; delete target.rates.flat; }
           });
         };
-        const writeRow = function (mode, field, value) {
+        const writeRow = function (mode: 'flat' | 'peak' | 'offPeak', field: keyof EditorRateRow, value: string): void {
           begin();
           update(function (next) {
             const target = next[providerIndex].models[modelIndex];
@@ -1640,7 +2326,7 @@ function PricingPage(props) {
           h('div', { className: 'dsm-usdLabel' }, isFlat ? 'USD per 1M tokens' : 'USD per 1M tokens (peak)'),
           h(RateFields, {
             row: row,
-            onChange: function (field, value) { writeRow(isFlat ? 'flat' : 'peak', field, value); },
+            onChange: function (field, value) { writeRow(isFlat ? 'flat' : 'peak', field as keyof EditorRateRow, value); },
           }),
           !isFlat
             ? (model.rates.offPeak !== undefined
@@ -1648,7 +2334,7 @@ function PricingPage(props) {
                     h('div', { className: 'dsm-usdLabel' }, 'USD per 1M tokens (off-peak)'),
                     h(RateFields, {
                       row: model.rates.offPeak,
-                      onChange: function (field, value) { writeRow('offPeak', field, value); },
+                      onChange: function (field, value) { writeRow('offPeak', field as keyof EditorRateRow, value); },
                     }))
                 : h('label', { className: 'dsm-rate' }, h('span', null, 'off-peak multiplier'),
                     h('input', {
@@ -1736,13 +2422,13 @@ function PricingPage(props) {
  * @param subject - the page's subject, as the owner passes it.
  * @returns true only for this plugin's own bundle or row page.
  */
-function isOurSubject(subject: any) {
-  if (subject === null || subject === undefined) return false;
-  const kind = subject.kind;
+function isOurSubject(subject: unknown): boolean {
+  const page = asRecord(subject);
+  if (page === null) return false;
+  const kind = page.kind;
   if (kind !== 'bundle' && kind !== 'row') return false;
-  const pkg = subject.pkg;
-  if (pkg === null || pkg === undefined) return false;
-  return pkg.name === PLUGIN_ID;
+  const pkg = asRecord(page.pkg);
+  return pkg !== null && pkg.name === PLUGIN_ID;
 }
 
 /**
@@ -1758,17 +2444,17 @@ function isOurSubject(subject: any) {
  * @param serviceGet - name → service, the badge's read of this plugin's configuration.
  * @returns the deferred registration the slot service returns.
  */
-function registerBadge(slots: any, serviceGet: (name: string) => any) {
+function registerBadge(slots: DshSlotsService, serviceGet: (name: string) => unknown): DshDisposable {
   return slots.inject('plugins.detail.badge', function () {
     return slots.register({
       name: 'plugins.detail.badge',
       id: PLUGIN_ID,
       order: 20,
       label: 'Session metrics: providers, models and the current peak state',
-    }, function (props: any) {
+    }, function (props: DshSlotProps) {
       // The gate sits outside the boundary on purpose: on another plugin's page
       // we must render nothing at all, not a failure chip of our own.
-      if (!isOurSubject(props && props.subject)) return null;
+      if (!isOurSubject(props.subject)) return null;
       return h(MetricsBoundary, null, h(PluginBadge, Object.assign({}, props, { serviceGet: serviceGet })));
     });
   });
@@ -1782,11 +2468,11 @@ const inject = ['slots'];
  * present even in a session that has been idle since the page opened.
  * @param ctx - client root context.
  */
-function apply(ctx) {
+function apply(ctx: DshClientContext): void {
   // Read opportunistically rather than as a declared dependency: a deployment
   // without the settings service still gets the strip, and the pricing page
   // degrades to its read-only form.
-  const getService = function (name) {
+  const getService = function (name: string): unknown {
     try {
       return typeof ctx.get === 'function' ? ctx.get(name) : undefined;
     } catch (error) {
@@ -1800,7 +2486,7 @@ function apply(ctx) {
     return ctx.slots.register({
       name: 'plugins.bundle.config',
       key: PLUGIN_ID,
-    }, function (props) {
+    }, function (props: DshSlotProps) {
       return h(MetricsBoundary, null, h(PricingPage, Object.assign({}, props, { getService: getService, surface: 'bundle' })));
     });
   });
@@ -1811,7 +2497,7 @@ function apply(ctx) {
       key: ROW_CONFIG_KEY,
       id: PLUGIN_ID,
       order: 12,
-    }, function (props) {
+    }, function (props: DshSlotProps) {
       return h(MetricsBoundary, null, h(PricingPage, Object.assign({}, props, { getService: getService, surface: 'row' })));
     });
   });
@@ -1828,24 +2514,27 @@ function apply(ctx) {
   // because the injection is what declares it. On the root context a service is only
   // readable as a property when it is declared, which is exactly why the badge is
   // attached through this door instead.
-  const canInject = (function () {
-    // Read through try/catch: on a restricted client context an undeclared property
-    // read THROWS (`cannot get property "…" without inject`), and the DOM harness
-    // reproduces that. A throw here means "no optional injection on this context",
-    // not a broken badge.
+  // The read and the narrowing happen inside one try/catch: on a restricted client
+  // context an undeclared property read THROWS (`cannot get property "…" without
+  // declaring it`), and the DOM harness reproduces that exactly. Reading `ctx.inject`
+  // once, here, both keeps the throw contained and gives the compiler a local it can
+  // narrow — `typeof ctx.inject === 'function'` cannot narrow an optional *method* at a
+  // later call site, and moving the read out of the guard is how this bundle first
+  // crashed the harness with that exact throw.
+  const inject = (function (): DshClientContext['inject'] {
     try {
-      return typeof ctx.inject === 'function';
+      return typeof ctx.inject === 'function' ? ctx.inject : undefined;
     } catch (error) {
-      return false;
+      return undefined;
     }
   })();
 
-  if (canInject) {
-    ctx.inject(['configForms'], function (child) {
+  if (typeof inject === 'function') {
+    inject.call(ctx, ['configForms'], function (child): void {
       // Prefer the injected declaration; keep `ctx.get('configForms')` as the
       // secondary source, because a service can be replaced while the badge is
       // mounted and both reads are honest when guarded.
-      registerBadge(child.slots, function (name) {
+      registerBadge(child.slots, function (name: string): unknown {
         if (name === 'configForms') {
           try {
             const injected = child.configForms;
@@ -1872,7 +2561,7 @@ function apply(ctx) {
   // restricted context an undeclared service read as a property THROWS
   // ("cannot get property ..."), which crashed this entry on its first render and
   // had the slot abdicate it — registered but invisible, with no error on screen.
-  const serviceOf = function (name) {
+  const serviceOf = function (name: string): unknown {
     try {
       return typeof ctx.get === 'function' ? ctx.get(name) : undefined;
     } catch (error) {
@@ -1880,11 +2569,12 @@ function apply(ctx) {
     }
   };
 
-  const refreshBaseline = function (sessionId) {
+  const refreshBaseline = function (sessionId?: string): void {
     if (sessionId === undefined) return;
-    const sessions = serviceOf('sessions');
-    if (sessions === undefined || typeof sessions.refreshProjections !== 'function') return;
-    Promise.resolve(sessions.refreshProjections(sessionId)).catch(function () {
+    const sessions = asRecord(serviceOf('sessions'));
+    const refresh = sessions?.refreshProjections;
+    if (typeof refresh !== 'function') return;
+    Promise.resolve(refresh.call(sessions, sessionId)).catch(function () {
       /* the normal session frame still carries the baseline */
     });
   };
@@ -1894,7 +2584,7 @@ function apply(ctx) {
       name: 'conversation.input.dock',
       id: PLUGIN_ID,
       order: 17,
-    }, function (props) {
+    }, function (props: DshSlotProps) {
       return h(MetricsBoundary, null, h(SessionMetricsPanel, Object.assign({}, props, { refreshProjections: refreshBaseline })));
     });
   });

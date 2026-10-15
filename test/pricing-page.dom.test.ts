@@ -519,11 +519,32 @@ const schemaShaped = [
   },
 ];
 
+/**
+ * Cards whose rate rows are **sparse**: some tier's row is absent, not null.
+ *
+ * `sparse-1` carries neither `flat` nor `peak` (only an explicit off-peak row), which is
+ * the shape `normalizeProviders` must synthesize a flat row for. `sparse-2` carries a
+ * `peak` row and nothing else, which must not grow an `offPeak` it was never given.
+ */
+const sparseCards = [
+  {
+    id: 'sparse-1',
+    models: [{ model: 'sparse-flat', aliases: [], rates: { offPeak: { cacheHit: '0.001', cacheMiss: '0.002', output: '0.003' } } }],
+    billing: { timezone: 'UTC', weekdays: [1, 2, 3, 4, 5], windows: [], holidays: [], holidayZone: 'Asia/Shanghai' },
+  },
+  {
+    id: 'sparse-2',
+    models: [{ model: 'sparse-peak', aliases: [], rates: { peak: { cacheHit: '0.006', cacheMiss: '0.3', output: '1.2' } } }],
+    billing: { timezone: 'UTC', weekdays: [1, 2, 3, 4, 5], windows: [[1, 4]], holidays: [], holidayZone: 'Asia/Shanghai' },
+  },
+];
+
 /** Mount the page with a schema-shaped config layer and capture writes. */
-function mountStoredConfig(): { view: MountedView; writes: any[] } {
+function mountStoredConfig(options: { cards?: unknown[] } = {}): { view: MountedView; writes: any[] } {
+  const cards = options.cards ?? schemaShaped;
   const writes: any[] = [];
   const form = {
-    state: { value: { providers: schemaShaped }, base: undefined, user: {}, revision: 9, writable: true },
+    state: { value: { providers: cards }, base: undefined, user: {}, revision: 9, writable: true },
     mutate: (ops: any[], revision: number) => { writes.push({ ops, revision }); return Promise.resolve(true); },
   };
   useConfigForms(undefined);
@@ -531,3 +552,50 @@ function mountStoredConfig(): { view: MountedView; writes: any[] } {
   const view = mount(loaded, loaded.slot('plugins.row.config'), { view: 'page', form, surface: 'row' });
   return { view, writes };
 }
+
+/**
+ * The labels of the rate fields `RateFields` renders inside `.dsm-rates` blocks.
+ *
+ * Scoped to `.dsm-rates` on purpose: the billing row's labels (zone, windows, weekdays)
+ * are other `.dsm-rate` elements in the same card, and counting those would make an
+ * assertion about rate rows depend on the calendar UI.
+ * @param card - one `.dsm-card` element.
+ * @returns the field labels, in render order.
+ */
+function rateFieldLabels(card: Element): string[] {
+  return [...card.querySelectorAll('.dsm-rates .dsm-rate')]
+    .map((label) => label.querySelector('span')?.textContent ?? '');
+}
+
+test('the editor renders a card whose rate rows are sparse instead of reading a missing tier', () => {
+  // The live crash was `rates.peak` undefined on a flat model. This pins both directions:
+  // a card with neither flat nor peak gets a flat row to edit, and a card with only a peak
+  // row does not grow an off-peak row it was never given — an invented row would be saved
+  // back as configuration the Host never served.
+  const { view } = mountStoredConfig({ cards: sparseCards });
+  try {
+    const text = view.text();
+    assert.equal(text.includes('session-metrics failed'), false, `must not crash: ${text.slice(0, 140)}`);
+    assert.equal(view.container.querySelectorAll('.dsm-card').length, sparseCards.length, 'one card per provider');
+    const cards = [...view.container.querySelectorAll('.dsm-card')];
+    // The model id is an input *value*, never text content, so it is read from the
+    // control rather than the rendered text — and the control is where the id matters.
+    const modelNames = [...view.container.querySelectorAll<HTMLInputElement>('.dsm-inputModel')].map((node) => node.value);
+    assert.deepEqual(modelNames, ['sparse-flat', 'sparse-peak'], 'both sparse models are listed, in order');
+    // sparse-1: a synthesized flat row (its four fields), no off-peak block.
+    const sparseFlat = rateFieldLabels(cards[0]);
+    assert.equal(sparseFlat.length, 4, 'the card with no flat/peak row gets exactly one editable flat row');
+    assert.equal(String(sparseFlat), 'cache hit,cache miss,cache write,output', 'and it is a complete flat row');
+    assert.equal(cards[0].textContent!.includes('off-peak multiplier'), false, 'and it is not treated as a peak model');
+    // sparse-2: the peak row plus the off-peak multiplier, no invented offPeak block.
+    const sparsePeak = rateFieldLabels(cards[1]);
+    assert.equal(sparsePeak.length, 4, 'the peak card has exactly one editable row');
+    assert.equal(cards[1].textContent!.includes('off-peak multiplier'), true, 'and derives off-peak from the multiplier, as the schema does');
+    assert.equal(String(sparsePeak).includes('off-peak'), false, 'with no invented offPeak block');
+    const pre = view.container.querySelector('pre');
+    assert.ok(pre !== null, 'the YAML block is still rendered for the editor');
+    assert.match(pre.textContent!, /sparse-1/, 'the equivalent patch block names the provider');
+  } finally {
+    view.unmount();
+  }
+});
