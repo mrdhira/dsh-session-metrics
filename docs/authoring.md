@@ -54,7 +54,7 @@ ctx.slots.inject('conversation.input.dock', () =>
 
 5. **Do not depend on a projection key of your own invention.** Shipped client
    packages read projections they declare; a third-party client half that needs host
-   data should use a **Remote** (see `dsh-skills-manager`, which injects
+   data should use a **Remote** (see `dsh-skill-managers`, which injects
    `['slots','sessions','remote','remote.skills']`) or read the store's erased path.
    If you do use `props.useProjection`, treat an absent key as "no data yet" and
    show the diagnostic.
