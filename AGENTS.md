@@ -17,25 +17,23 @@ This is a rule, not a preference:
 3. **Agents assist; they do not author.** Work an agent did is described in the commit *body* as
    prose ("Evidence: …"), never as an authorship trailer.
 4. **`Signed-off-by:` is allowed** — it is Dhira's own sign-off (`git commit -s`), not a second author.
-5. **The rule is enforced, not merely written.** `.githooks/commit-msg` rejects a message carrying any
-   of the above and exits non-zero. It is active because this clone sets
-   `core.hooksPath = .githooks`. A fresh clone must set it (see below). `--no-verify` bypasses it
-   deliberately; do not use it to smuggle a trailer back in.
+5. **CI is the gate.** `.github/workflows/ci.yml` checks the whole history — one identity, no
+   authorship trailers — and runs build, typecheck and the suite. There is no local hook: the rule is
+   checked where it cannot be skipped (`--no-verify` does not reach CI).
 
 Identity is set **repo-locally**, so it applies here and nowhere else:
 
 ```bash
 git config --local user.name  "Dhira Wigata"
 git config --local user.email "dwigata.putra@gmail.com"
-git config --local core.hooksPath .githooks     # required on a fresh clone
 ```
 
 ### Why
 
 History was rewritten once because all eleven commits carried
 `J.A.R.V.I.S. <jarvis@dsh>` as author *and* committer — a machine identity publishing under Dhira's
-GitHub account. A rule that lives only in prose would have decayed the same way; the hook is what
-makes it hold. See `tasks/lesson.md` in `~/.dsh` for the incident anchor.
+GitHub account. See `tasks/lesson.md` in `~/.dsh` for the incident anchor, and
+`~/.dsh/rules/GIT-AUTHORSHIP.md` for the rule.
 
 ## The loop — how work happens here
 
@@ -74,7 +72,6 @@ build.mjs             esbuild: ESM host half, CJS browser half + loader handshak
 docs/authoring.md     the client-half contract and the validation recipe
 docs/data-sources.md  which projection feeds which figure, and why
 docs/pricing.md       the shipped rate cards and the rules behind them
-.githooks/commit-msg  the authorship guard
 ```
 
 ## Deployment

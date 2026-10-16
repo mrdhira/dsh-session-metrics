@@ -38,6 +38,7 @@
     "test:dom": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=20000 --test-force-exit test/client.dom.test.ts test/pricing-page.dom.test.ts",
     "test:replay": "node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=512 --test --test-isolation=none --test-timeout=30000 --test-force-exit test/replay.test.ts",
     "build": "node build.mjs",
+    "prepare": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.dynamic.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "pretest": "npm run build"
   },

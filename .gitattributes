@@ -1,15 +1,16 @@
-# One author, one line ending. `text=auto` lets git normalise on the way in and
-# out; the explicit pins below cover files whose bytes matter more than their
-# rendering.
+# One line ending everywhere. `text=auto` lets git normalise on the way in and
+# out, so a clone on any platform gets the same bytes.
 * text=auto eol=lf
 
-# Shell hooks must keep LF: a CRLF in the shebang line makes a hook unrunnable,
-# and on macOS that failure is silent until the hook is needed.
-*.sh   text eol=lf
-.githooks/* text eol=lf
+# Shell scripts must keep LF: a CRLF in a shebang makes the script unrunnable,
+# and on macOS that failure is silent until the script is needed.
+*.sh text eol=lf
 
-# Generated or binary-ish: never let git rewrite these.
+# Binaries: never let git rewrite these.
 *.png  binary
 *.jpg  binary
 *.zst  binary
+
+# Generated: collapse it in diffs and reviews.
 pnpm-lock.yaml  -diff linguist-generated
+lib/**          linguist-generated

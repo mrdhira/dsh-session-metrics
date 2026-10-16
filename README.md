@@ -1,10 +1,13 @@
 # dsh-session-metrics
 
-Session **cost and billing** metrics for the DSH Web GUI: what this conversation
-cost, what the cache saved, and whether the current hour is peak or off-peak —
-complementing the shipped stats pills instead of repeating them.
+Session **cost and billing** metrics for the DSH Web GUI.
 
-## What it adds
+It answers three questions the shipped status pills do not: **what did this conversation cost**,
+**what did the cache save**, and **am I in peak or off-peak billing hours right now**. It is built
+as a companion to those pills, never a duplicate — token totals, context usage, turns and tok/s
+still belong to the pills and stay there.
+
+## What you get
 
 A strip below the composer, in the same seat as the shipped status pills:
 
@@ -16,61 +19,94 @@ A strip below the composer, in the same seat as the shipped status pills:
 | provider | shown when it is not your configured primary provider |
 | `budget` | progress against an optional per-session ceiling |
 
-A provider whose models are free renders `$0.00` (a real zero, from a zero-rate
-card), not `unpriced`. `unpriced` means *no card*, and an unpriced pair is never
-rendered as a number.
+Click it to open the detail: cost breakdown (cache-hit / miss / write / output), cache savings and
+blended rate, the rate window with a countdown to the next change, cost per step, cost per model when
+a session switched models, and the projections each figure came from.
 
-Clicking it opens the detail: cost breakdown (cache-hit / miss / write / output),
-cache savings and blended rate, the rate window with a countdown to the next
-change, cost per step, cost per model when a session switched models, and the
-projections each figure came from.
+Every chip is optional and reorderable — see [Configure](#configure).
 
-## New providers and models are discovered, never silent
+## Two guarantees
 
-Integrate a provider and use it before its rates are configured, and the session's
-own detail says so: a **Seen, unpriced** section lists every provider/model pair
-the ledger actually observed with no rate card, with the tokens it used, and the
-model table marks the row `unpriced`. Nothing is invented, and nothing is hidden —
-the pair is named so a rate card can be added where rates are edited.
+**A number is never invented.** A provider or model with no rate card reads `unpriced`: tokens are
+still shown, no cost is fabricated. A free model is the opposite case — it ships a card of zeros and
+reads a real `$0.00`, because *zero* and *unknown* are different claims and must not render alike.
 
-A free model needs a card of zeros, not the absence of one: the absence is what
-prints `unpriced`. `docs/pricing.md` carries the details and the shipped cards.
-
-## What it deliberately does not show
-
-The shipped stats pills already own these, so this plugin never renders them:
-session token totals, cache-hit rate, context percentage and composition, turns,
-steps, or tok/s. `docs/data-sources.md` records exactly which projection feeds
-which figure so the two can't drift back into duplication.
+**A new provider is never silent.** Integrate a provider and use it before its rates are configured,
+and the session detail says so: a **Seen, unpriced** section lists every provider/model pair the
+ledger actually observed, with the tokens it used, so you can go add the card. Nothing is hidden, and
+the session tells you rather than leaving you to guess why a cost is missing.
 
 ## Install
 
-The plugin lives in the user profile, so every workspace on this machine gets it:
+The plugin is installed into your DSH **profile** — the same place DSH itself keeps its bundles — by
+linking it as a dependency. It is not published to npm, so the clone is the source.
 
-```
-~/.dsh/profiles/desktop/dsh-session-metrics/
+**1. Clone somewhere stable.** The path becomes your install path, so avoid a temporary directory:
+
+```bash
+git clone https://github.com/mrdhira/dsh-session-metrics.git ~/.dsh/plugins/dsh-session-metrics
+cd ~/.dsh/plugins/dsh-session-metrics
 ```
 
-and is registered in that profile's `package.json`:
+**2. Install and build.** `pnpm install` fetches esbuild and runs the `prepare` script, which builds
+the plugin. The built `lib/**` is the part DSH actually loads, and it is generated — never hand-edit
+it.
+
+```bash
+pnpm install
+```
+
+**3. Register it with your profile.** In your profile's `package.json` (the one that lists the
+bundles DSH starts with), add the dependency and the bundle name. Use an absolute path:
 
 ```json
-"dependencies": { "dsh-session-metrics": "link:/Users/<you>/.dsh/profiles/desktop/dsh-session-metrics" }
+{
+  "dependencies": {
+    "dsh-session-metrics": "link:/Users/<you>/.dsh/plugins/dsh-session-metrics"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "dsh-session-metrics"
+      ]
+    }
+  }
+}
 ```
 
-Host-side changes need an app restart; client-side changes need a page reload.
-(The running app caches a plugin module for the life of the process, so editing a
-host file has no effect until restart — see `docs/data-sources.md`.)
+**4. Install the link, then restart DSH:**
+
+```bash
+cd ~/.dsh/profiles/desktop && pnpm install
+```
+
+The bundle's Loader row is declared in its own `cordis.patch.yml`, so there is nothing to add by hand.
+
+> **Restart, don't reload.** The host half of a plugin is loaded once per app process, so a host-side
+> change needs a full quit and reopen (`⌘Q`, then reopen) — a page reload does not pick it up. A
+> client-side (UI) change needs the bundle toggled in the plugin manager.
+
+### Verify it is really working
+
+The chip should appear under the composer immediately. If it does not, check that:
+
+- `lib/v1/index.js` and `lib/v1/client.js` exist — if not, `pnpm install` did not finish building;
+- the profile's `package.json` names `dsh-session-metrics` in **both** `dependencies` and
+  `dsh.profile.bundles`;
+- DSH was **restarted** after installing (a host half loads once, at startup).
+
+An `unpriced` chip is a working install with no matching rate card — not a failure. See
+[Configure](#configure).
 
 ## Configure
 
-Rates ship for `deepseek-account`, `deepseek-official`, `netra-runtime` and
-`openrouter`, so a **fresh install** needs no configuring; a profile patch that
-lists its own `providers` replaces those shipped cards rather than adding to them
-(see the note below). OpenRouter ships **only the
-models its own catalog marks free** (the `:free` suffix, and the free-models
-router) at zero rates; its paid models deliberately have no card, because the
-profile lists no prices for them. To change a rate, either open the plugin's page
-in the **Plugins** sidebar, or edit your profile's `cordis.patch.yml`:
+**A fresh install needs no configuration.** Rate cards ship for `deepseek-account`,
+`deepseek-official`, `netra-runtime` and `openrouter`, so the cost chip works right away. OpenRouter
+ships **only the models its own catalog marks free** (the `:free` suffix and the free-models router)
+at zero rates; its paid models deliberately carry no card, because DSH reports no prices for them.
+
+Rates are edited in the GUI: **Plugins sidebar → `dsh-session-metrics`**. The same table can be set in
+your profile's `cordis.patch.yml`:
 
 ```yaml
 - id: session-metrics
@@ -86,131 +122,93 @@ in the **Plugins** sidebar, or edit your profile's `cordis.patch.yml`:
         billing: { windows: [] }      # no peak concept
 ```
 
-A `providers:` list in your patch **replaces** the shipped cards rather than
-adding to them, so a profile that pins its own providers stops shipping the
-OpenRouter free cards with them. Add a card for the pair — or leave it out and
-let the **Seen, unpriced** section name it (see above).
+Rates are USD per 1M tokens. A model takes **either** a `flat` row **or** a `peak` row with
+`offPeak`. A provider with no `billing.windows` is flat and shows no peak chip.
 
-`docs/pricing.md` documents the full rate-card format, the shipped cards, the
-free-model rule and the evidence behind Netra's rates.
+> **A `providers:` list in your patch replaces the shipped cards** rather than adding to them. Pin your
+> own providers and the OpenRouter free cards stop shipping with them — add a card for each pair you
+> need, or let **Seen, unpriced** name the ones you missed.
 
-## Develop
+Common settings:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `display.currency` | `USD` | `USD` or `CNY` |
+| `display.primaryProvider` | — | hides the provider chip when the session uses this provider |
+| `display.chips` | all | which chips to show, and in what order |
+| `budget.sessionUsd` | off | per-session ceiling; omit to disable |
+| `budget.warnAt` | `0.75` | fraction of the budget at which the strip warns |
+
+The full rate-card format, the shipped cards and the reasoning behind them are in
+[`docs/pricing.md`](docs/pricing.md).
+
+## How it works
+
+Costs are derived from the Host's own `tokenUsage` projection — the same source the stats pills read —
+so this plugin adds interpretation, not a second ledger. Cache savings compare each cache-hit token
+against the rate you would have paid on a miss, per the card in effect. Peak and off-peak windows are
+resolved in the provider's own timezone, holidays included, and the countdown is computed once a
+minute while the detail view is open rather than on every render.
+
+[`docs/data-sources.md`](docs/data-sources.md) records exactly which projection feeds which figure,
+which is what keeps this plugin and the shipped pills from drifting back into duplication.
+
+## Requirements
+
+- **DSH** with the Web GUI, and a profile you can edit (`~/.dsh/profiles/<profile>/`).
+- **Node.js 22+** and **pnpm** to build from source. The built artifact needs nothing extra at runtime.
+
+## Development
 
 ```bash
-pnpm install                        # once, on a fresh clone
-pnpm run build                      # first: the tests import the generated lib/**
-pnpm test                           # 111 tests (105 pass, 6 skipped without a log)
-pnpm run typecheck                  # three projects: host, browser half, tests
-DSH_SESSION_LOG=<path>.jsonl.zstd pnpm run test:replay
+pnpm install                  # installs deps and builds (prepare)
+pnpm run build                # rebuild lib/**
+pnpm test                     # 111 tests: 105 pass, 6 skipped without a session log
+pnpm run typecheck            # three projects: host, browser half, tests
+pnpm run test:fast            # host logic only — the quick loop
+pnpm run test:dom             # the UI half under jsdom
+DSH_SESSION_LOG=<path>.jsonl.zstd pnpm run test:replay   # replays a real session
 ```
 
-The counts above are from Node v24.18.0: `111 tests / 105 pass / 0 fail / 6 skipped`
-without a session log, and all 111 passing once `DSH_SESSION_LOG` points at a real
-`.jsonl.zstd` session. The six skipped tests are the replay ones, which need that log.
-
-The replay test compares this plugin's fold against a reimplementation of the
-official `tokenUsage` projection over a real session log — it is what caught two
-token-accounting bugs during development, and it is the guard that keeps the two
-from disagreeing. `docs/data-sources.md` records the findings that shaped the
-design, including the Host's native-schema requirement for a config page.
-
-
-## Layout and commands
+The six skipped tests are the replay ones; they need `DSH_SESSION_LOG` pointing at a real recorded
+session (`.jsonl.zstd`). With one, the suite is **111/111**.
 
 ```
-src/host/*.ts        host half: Config schema, projection, ledger, pricing   -> lib/v1/index.js
-src/client/index.cts browser half: strip, detail panel, pricing page         -> lib/v1/client.js
-types/dsh.d.ts       the DSH surfaces this plugin uses (the app ships no .d.ts)
-build.mjs            esbuild: ESM host half, CJS browser half + loader handshake
+src/host/*.ts         host half: config schema, projection, ledger, pricing  -> lib/v1/index.js
+src/client/index.cts  browser half: strip, detail panel, pricing page        -> lib/v1/client.js
+types/dsh.d.ts        the DSH surfaces this plugin uses (the app ships no .d.ts)
+build.mjs             esbuild: ESM host half, CJS browser half + loader handshake
 ```
 
-`lib/**` is generated — never edit it. `npm run build` then `npm test` (`pretest` builds for you);
-`npm run typecheck` gates three projects (host, browser half, tests).
+**Build before you test.** The tests import the generated `lib/**`, so a run against a stale build is
+green and wrong. `pnpm test` builds for you via `pretest`.
 
-**On a fresh clone, build before anything else.** The tests import `lib/**` and the test project's
-typecheck resolves its types from those built bytes, so `lib/` must exist first — it is generated and
-therefore not in the repository.
+### Memory discipline
 
-The strip shows, in order: peak state (`▲ ON PEAK HOURS` / `▼ OFF PEAK HOURS`), local time,
-cost, cache savings and the provider. The detail panel shows a cost breakdown, a saving
-breakdown, the provider/model table and the timezone comparison, with a tooltip on every
-figure that needs one. Rates are edited on the plugin's component row (see below).
+Two defects once drove a developer machine to ~170 GB of resident memory, so the suite is capped
+rather than trusted:
 
-## Memory discipline
+- **Never let a DOM node be an assertion's actual value** — compare primitives
+  (`assert.ok(node === null)`, `assert.equal(list.length, 3)`). A failing node comparison makes the
+  test runner walk React's fiber tree and allocate without bound.
+- **Cap the process.** `scripts/guard.mjs` watches the whole process tree's resident memory and kills
+  it past the limit (exit code **124**). `--max-old-space-size` alone bounds V8's heap, not native
+  allocation. Run the suite through the scripted entry points, which carry the caps, and one run at a
+  time.
 
-Two defects once took a developer machine to ~170 GB of resident memory. Both are
-fixed, and the rules that keep them fixed are enforced by the test scripts.
+Measured on Node v24: host tests peak ~70 MB, the DOM file ~180 MB, and the full suite with a real-log
+replay **277 MB under a 1 GB limit**.
 
-**What happened.** A single integration test passed `sessionId: undefined`, which a
-default parameter silently replaced, so its assertion failed — and the failing
-assertion's `actual` value was a **React-rendered DOM element**. The runner's
-assertion message inspects that value, walking React's fiber tree (whose props
-carry the whole settings object and up to 200 ledger rows) and jsdom's getters, and
-allocation ran away. Amplified by `node --test` spawning a child per file and by
-several test runs overlapping in the background, it consumed the machine.
+## Agent skill
 
-A second defect fed it: `nextBoundary()` constructed an `Intl.DateTimeFormat` for
-every probed minute — up to 4,320 per call — and ran on **every render**, including
-the one-second tick while the detail panel was open.
-
-**The rules.**
-
-1. **Never let a DOM node be an assertion's actual value.** Compare a primitive:
-   `assert.ok(node === null)`, `assert.equal(list.length, 3)`,
-   `assert.equal(node.getAttribute('x'), 'y')`. A failing node comparison is an
-   unbounded allocation.
-2. **Cap the process.** `--max-old-space-size` alone is not enough — it bounds V8's
-   old space, not native allocation. `scripts/guard.mjs` watches the whole process
-   tree's resident memory and SIGKILLs it past a limit (exit code 124):
-
-   ```bash
-   node scripts/guard.mjs --limit-mb 1024 -- node --max-old-space-size=384 --test ...
-   ```
-
-3. **Run the suite through the scripted entry points**, which carry the caps:
-   `npm test`, `npm run test:fast`, `npm run test:dom`, `npm run test:replay`.
-4. **One run at a time.** Never leave a suite running in the background while
-   starting another.
-5. **Do not scan for a boundary on every render.** The countdown is memoized to
-   once a minute and computed only while the detail view is open; formatters are
-   cached per zone.
-
-**Measured** (Node v24, this suite): fast host tests 70 MB peak; the DOM file
-180 MB; the whole suite with a real-log replay **277 MB peak under a 1 GB limit**.
-
-## Building on it
-
-`docs/authoring.md` records the contract for a DSH Web plugin's client half and the
-validation recipe that actually reflects the running client — the acceptance signal
-is the slot inspector's `active` flag, not the registration listing. It exists
-because this plugin spent hours registered, reported healthy, and rendering nothing.
-
-## Skill
-
-The plugin registers an embedded agent skill, `session-metrics`, so after install
-the agent can explain the figures and reconfigure the rates without reading the
-source.
+Installing the plugin also registers an agent skill, `session-metrics`, so an agent can explain the
+figures and reconfigure the rates without reading the source.
 
 ## Contributing
 
-One author: **Dhira Wigata** `<dwigata.putra@gmail.com>`. Every commit in this repository is authored
-and committed by him, and `.githooks/commit-msg` refuses `Co-authored-by`, `Generated with …` and the
-rest of the machine-attribution trailer class. `Signed-off-by:` is fine.
-
-On a fresh clone, wire the guard and the identity — they are repo-local and are not carried by the
-clone itself:
-
-```bash
-git config --local user.name  "Dhira Wigata"
-git config --local user.email "dwigata.putra@gmail.com"
-git config --local core.hooksPath .githooks
-git config --local commit.template .gitmessage
-```
-
-CI re-checks this across the **whole history** (`.github/workflows/ci.yml`, the `authorship` job), so
-the rule holds even when the hook is bypassed locally. See `AGENTS.md` and
-`~/.dsh/rules/GIT-AUTHORSHIP.md`.
+Issues and pull requests are welcome. `AGENTS.md` describes the project's conventions and the gates a
+change must pass — build, typecheck and the test suite — before it can be merged.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE) © Dhira Wigata

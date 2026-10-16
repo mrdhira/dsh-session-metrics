@@ -54,7 +54,7 @@ jobs:
 
       # This repository credits exactly one author. The check is a gate, not a
       # report: a machine identity or an authorship trailer fails the build.
-      # See .githooks/commit-msg and ~/.dsh/rules/GIT-AUTHORSHIP.md.
+      # See ~/.dsh/rules/GIT-AUTHORSHIP.md.
       - name: Every commit is Dhira's, and carries no agent trailer
         run: |
           set -eu
