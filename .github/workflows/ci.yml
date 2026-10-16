@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # One run per ref: a second push cancels the first rather than racing it. This
+  # suite is memory-heavy (the DOM suite peaks ~180 MB, the replay ~277 MB), so
+  # overlapping runs on the same ref are wasted minutes.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install (esbuild's build script is allowed in pnpm-workspace.yaml)
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (three projects: host, browser half, tests)
+        run: pnpm run typecheck
+
+      # `pretest` builds first, and it must: the tests import the generated lib/**
+      # and the test project's typecheck resolves its types from those built bytes.
+      - name: Test
+        run: pnpm test
+
+  authorship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, so every commit's author and message can be checked.
+          fetch-depth: 0
+
+      # This repository credits exactly one author. The check is a gate, not a
+      # report: a machine identity or an authorship trailer fails the build.
+      # See .githooks/commit-msg and ~/.dsh/rules/GIT-AUTHORSHIP.md.
+      - name: Every commit is Dhira's, and carries no agent trailer
+        run: |
+          set -eu
+          failed=0
+
+          echo "== authors =="
+          git log --format='%h|%an <%ae>|%cn <%ce>|%s' | tee /tmp/authors.txt
+          # Identities only, deliberately without the subject line: a commit body or
+          # subject may legitimately *mention* the assistant in prose ("Jarvis wrote
+          # this; Dhira reviewed it"). Check the claim, not the vocabulary.
+          git log --format='%an <%ae>%n%cn <%ce>' | sort -u > /tmp/identities.txt
+          cat /tmp/identities.txt
+
+          if grep -iE 'jarvis|j\.a\.r\.v\.i\.s|@dsh|noreply@anthropic|codex|copilot|\[bot\]' /tmp/identities.txt; then
+            echo "::error::A non-human identity appears in the commit history."
+            failed=1
+          fi
+
+          if [ "$(cat /tmp/identities.txt)" != "Dhira Wigata <dwigata.putra@gmail.com>" ]; then
+            echo "::error::Expected exactly one identity: Dhira Wigata <dwigata.putra@gmail.com>."
+            failed=1
+          fi
+
+          echo "== authorship trailers =="
+          if git log --format='%B' | grep -inE '^[[:space:]]*(co-authored-by|co-developed-by|generated-by|assisted-by)[[:space:]]*:'; then
+            echo "::error::An authorship trailer is present in the history."
+            failed=1
+          fi
+
+          if git log --format='%B' | grep -inE '^[[:space:]]*generated with[[:space:]]+(claude|codex|copilot|cursor|chatgpt|deepseek)|^[[:space:]]*🤖.*generated'; then
+            echo "::error::An agent byline/footer is present in the history."
+            failed=1
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Authorship gate failed."
+            exit 1
+          fi
+          echo "Authorship gate passed: $(git rev-list --count HEAD) commits, one author, no trailers."

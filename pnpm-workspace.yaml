@@ -1,2 +1,6 @@
+# pnpm 11 blocks dependency build scripts by default. esbuild's postinstall links
+# its platform binary, and the build (`node build.mjs`) needs it, so it is allowed
+# by name rather than blanket-approved. Verified against pnpm 11.24.0, which reads
+# this as `allowBuilds: { <package>: true }`.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true

@@ -1,0 +1,15 @@
+# One author, one line ending. `text=auto` lets git normalise on the way in and
+# out; the explicit pins below cover files whose bytes matter more than their
+# rendering.
+* text=auto eol=lf
+
+# Shell hooks must keep LF: a CRLF in the shebang line makes a hook unrunnable,
+# and on macOS that failure is silent until the hook is needed.
+*.sh   text eol=lf
+.githooks/* text eol=lf
+
+# Generated or binary-ish: never let git rewrite these.
+*.png  binary
+*.jpg  binary
+*.zst  binary
+pnpm-lock.yaml  -diff linguist-generated

@@ -97,9 +97,16 @@ free-model rule and the evidence behind Netra's rates.
 ## Develop
 
 ```bash
-node --test "test/*.test.ts"                       # 103 tests
-DSH_SESSION_LOG=<path>.jsonl.zstd node --test test/replay.test.js
+pnpm install                        # once, on a fresh clone
+pnpm run build                      # first: the tests import the generated lib/**
+pnpm test                           # 111 tests (105 pass, 6 skipped without a log)
+pnpm run typecheck                  # three projects: host, browser half, tests
+DSH_SESSION_LOG=<path>.jsonl.zstd pnpm run test:replay
 ```
+
+The counts above are from Node v24.18.0: `111 tests / 105 pass / 0 fail / 6 skipped`
+without a session log, and all 111 passing once `DSH_SESSION_LOG` points at a real
+`.jsonl.zstd` session. The six skipped tests are the replay ones, which need that log.
 
 The replay test compares this plugin's fold against a reimplementation of the
 official `tokenUsage` projection over a real session log — it is what caught two
@@ -184,6 +191,26 @@ The plugin registers an embedded agent skill, `session-metrics`, so after instal
 the agent can explain the figures and reconfigure the rates without reading the
 source.
 
+## Contributing
+
+One author: **Dhira Wigata** `<dwigata.putra@gmail.com>`. Every commit in this repository is authored
+and committed by him, and `.githooks/commit-msg` refuses `Co-authored-by`, `Generated with …` and the
+rest of the machine-attribution trailer class. `Signed-off-by:` is fine.
+
+On a fresh clone, wire the guard and the identity — they are repo-local and are not carried by the
+clone itself:
+
+```bash
+git config --local user.name  "Dhira Wigata"
+git config --local user.email "dwigata.putra@gmail.com"
+git config --local core.hooksPath .githooks
+git config --local commit.template .gitmessage
+```
+
+CI re-checks this across the **whole history** (`.github/workflows/ci.yml`, the `authorship` job), so
+the rule holds even when the hook is bypassed locally. See `AGENTS.md` and
+`~/.dsh/rules/GIT-AUTHORSHIP.md`.
+
 ## Licence
 
-MIT.
+MIT — see [LICENSE](LICENSE).

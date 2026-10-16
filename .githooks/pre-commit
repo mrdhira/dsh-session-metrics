@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Refuse to commit under any identity but Dhira's.
+#
+# `commit-msg` guards the message; this guards the identity that is about to be
+# written into the commit. Both are needed: a clean message from `jarvis@dsh`
+# is still a machine publishing under Dhira's account.
+#
+# Bypass deliberately, if ever needed:  git commit --no-verify
+set -eu
+
+name="$(git config --get user.name || true)"
+email="$(git config --get user.email || true)"
+
+EXPECT_NAME="Dhira Wigata"
+# Home, work and GitHub noreply forms of the same address are all Dhira.
+case "$email" in
+  dwigata.putra@gmail.com|28551306+mrdhira@users.noreply.github.com) ;;
+  *)
+    echo "pre-commit: REFUSED — committing as '$name <$email>'." >&2
+    echo "  This repository credits Dhira Wigata <dwigata.putra@gmail.com> only." >&2
+    echo "  Fix it locally:  git config --local user.name '$EXPECT_NAME'" >&2
+    echo "                   git config --local user.email 'dwigata.putra@gmail.com'" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$name" != "$EXPECT_NAME" ]; then
+  echo "pre-commit: REFUSED — user.name is '$name', expected '$EXPECT_NAME'." >&2
+  echo "  Fix it locally:  git config --local user.name '$EXPECT_NAME'" >&2
+  exit 1
+fi
+
+exit 0

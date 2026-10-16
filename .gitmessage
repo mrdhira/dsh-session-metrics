@@ -1,0 +1,13 @@
+# <type>: <imperative summary, <= 72 chars>
+#
+# Types: feat | fix | refactor | perf | test | docs | build | ci | chore | release
+#
+# Why, not what — the diff already shows what. Explain the reasoning a reader
+# cannot recover from the code, and name the evidence:
+#
+#   Evidence: build clean; typecheck 0 errors; suite 111/111.
+#
+# One blank line between the summary and the body. This repository credits
+# exactly one author (Dhira Wigata <dwigata.putra@gmail.com>), so no
+# Co-authored-by, no "Generated with ...", no agent bylines — .githooks/commit-msg
+# refuses them. Signed-off-by is fine.
