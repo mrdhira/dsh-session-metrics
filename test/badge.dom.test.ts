@@ -216,7 +216,7 @@ test('badge: a foreign subject renders nothing, even with our configuration behi
   // is what must suppress the chip.
   const foreign: Array<[string, unknown]> = [
     ['another bundle', { kind: 'bundle', pkg: { name: 'deepseek-account' } }],
-    ['another row', { kind: 'row', pkg: { name: 'dsh-skills-manager' }, row: { rowId: 'skills' } }],
+    ['another row', { kind: 'row', pkg: { name: 'dsh-skill-managers' }, row: { rowId: 'skills' } }],
     ['another item', { kind: 'item', id: 'other-plugin#config' }],
   ];
   for (const [label, subject] of foreign) {
