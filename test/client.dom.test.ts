@@ -425,6 +425,8 @@ test('details: the timezone section reports both clocks, one local sentence, no 
     assert.match(text, /Provider time/, 'the billing clock');
     assert.match(text, /UTC/);
     // Only the reader's zone: the provider's clock was noise once the windows are translated.
+    // The sentence follows the reader's zone, so the suite pins TZ=Asia/Tokyo (package.json);
+    // without the pin a UTC runner correctly prints the provider's own hours instead.
     assert.match(text, /Peak hours run on weekdays 10:00\u201313:00 and 15:00\u201319:00 Asia\/Tokyo/, `schedule sentence: ${text}`);
     assert.equal(/01:00\u201304:00/.test(text), false, 'the provider-zone window list is gone');
     assert.match(text, /Ongoing|Next in|None/, 'a short peak state');
