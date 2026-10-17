@@ -34,7 +34,7 @@ jobs:
       - name: Install (esbuild's build script is allowed in pnpm-workspace.yaml)
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck (three projects: host, browser half, tests)
+      - name: "Typecheck (three projects: host, browser half, tests)"
         run: pnpm run typecheck
 
       # `pretest` builds first, and it must: the tests import the generated lib/**
