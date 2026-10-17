@@ -227,6 +227,47 @@ change must pass: build, typecheck across three projects, and the suite.
 
 Issues and pull requests are welcome.
 
+## What it looks like
+
+The strip as it docks under the composer, at the width the app actually gives it: DSH's own
+`computeColumns()` resolves a 1440×900 window to a 280px sidebar and a **1160px** centre column, and
+that is the canvas below. Every colour is one of the app's theme tokens.
+
+| light | dark |
+|---|---|
+| ![The strip in the light theme](docs/screenshots/panel-light.png) | ![The strip in the dark theme](docs/screenshots/panel-dark.png) |
+
+The detail popover behind the trigger — cost breakdown, saving breakdown, per-model rows, and the peak
+window with its countdown.
+
+| light | dark |
+|---|---|
+| ![The detail popover in the light theme](docs/screenshots/detail-light.png) | ![The detail popover in the dark theme](docs/screenshots/detail-dark.png) |
+
+Both come from `scripts/capture-panel.mts`, which renders the **real** bundle through
+`test/harness.ts` — the same path the DOM tests take — injects the **real** stylesheet the bundle
+itself ships, and resolves the `--dsw-*` tokens out of the installed `app.asar`. Nothing is mocked and
+no colour is hand-picked. Run it with:
+
+```bash
+node ~/.dsh/scripts/guard/guard.mjs --limit-mb 2560 -- \
+  node --max-old-space-size=384 scripts/capture-panel.mts
+```
+
+One honest gap: the popover is captured **standalone**, centred by a layout wrapper, rather than
+anchored under the strip. Its `left`/`bottom` come from a live `getBoundingClientRect()` of the docked
+trigger, and the headless renderer has no layout engine to produce one — so its content, width and
+styles are real, and only the frame around it is not.
+
+### There is no flow to draw
+
+This is a metrics panel, not a pipeline: the strip and the popover are two projections of one
+already-complete figure. Costs are derived from the Host's own `tokenUsage` projection, savings compare
+each cache-hit token against the miss rate on the same card, and the peak state is a clock read against
+the provider's window — all computed in the browser half on render. No queue, no stages, no hand-off,
+and no ordering a diagram would add information to. A flow diagram here would be decoration, so there
+is none; the data path is the table in [`docs/data-sources.md`](docs/data-sources.md) instead.
+
 ## LICENSE
 
 [MIT](LICENSE) © Dhira Wigata
